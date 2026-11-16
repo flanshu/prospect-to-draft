@@ -1,0 +1,36 @@
+# ---- Credentials: never commit these ----
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+service-account*.json
+
+# ---- Local data ----
+outreach_runs.db
+outreach_runs.db-journal
+*.sqlite3
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Case-study material, not part of the deliverable ----
+ASA Case Study*.pdf
+Agentic-Harness-*.zip

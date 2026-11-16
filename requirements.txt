@@ -1,0 +1,8 @@
+# Personalised outreach prototype -- minimal runtime dependencies.
+streamlit>=1.40
+google-genai>=1.20
+python-dotenv>=1.0
+
+# Hosted history on Supabase Postgres. Harmless locally: without DATABASE_URL
+# the app uses the SQLite file instead.
+psycopg[binary]>=3.1
