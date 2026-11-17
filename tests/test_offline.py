@@ -17,11 +17,12 @@ import pytest  # noqa: E402
 from outreach import config, fixtures, pipeline, verify  # noqa: E402
 from outreach.gemini_client import ResearchProviderError  # noqa: E402
 from outreach.pipeline import _strip_unverified_quotes, stage_score  # noqa: E402
-from outreach.store import _signal_text  # noqa: E402
+from outreach.store import _product_text, _signal_text  # noqa: E402
 from outreach.schema import (  # noqa: E402
     CONTEXT_ONLY,
     ELIGIBLE,
     EXCLUDED,
+    MIN_PRODUCT_RELEVANCE,
     PROV_MODEL,
     PROV_SEARCH_SUMMARY,
     PROV_SOURCE_TEXT,
@@ -32,7 +33,21 @@ from outreach.schema import (  # noqa: E402
     STATUS_RESEARCH_INCOMPLETE,
     Finding,
     Run,
+    Score,
 )
+
+INVOICE = "invoice_matching"
+RECEIPTS = "receipt_tracking"
+# Capabilities the scoring layer will accept for each product, copied from the
+# catalogue so a renamed capability fails loudly here rather than silently.
+INVOICE_CAP = "Comparing supplier invoices with purchase orders"
+RECEIPTS_CAP = "Collecting missing employee expense receipts"
+
+
+def _run_for(product_id: str, **kwargs) -> Run:
+    kwargs.setdefault("prospect_name", "Maya Iyer")
+    kwargs.setdefault("company", "Aurora Freight")
+    return Run(product=config.product(product_id), **kwargs)
 
 PAGE = (
     "<html><body><h1>Accounts Payable Analyst</h1>"
@@ -117,17 +132,14 @@ def test_draft_guardrail_strips_unverified_quotes():
 
 def test_a_high_total_never_overrides_a_failed_evidence_gate(monkeypatch):
     """8 of 10 must never produce a draft when the evidence is unsupported."""
-    run = Run(prospect_name="A B", company="C")
+    run = _run_for(INVOICE, prospect_name="A B", company="C")
     run.findings = [
         Finding(claim="They are replacing their AP system", publisher="p", url="u",
                 finding_id="f-1", provenance=PROV_SEARCH_SUMMARY),
     ]
-    monkeypatch.setattr(pipeline, "json_call", lambda *a, **k: {"scores": [{
-        "finding_id": "f-1",
-        "product_relevance": 3, "prospect_relevance": 3,
-        "evidence_quality": 0, "timeliness": 2,
-        "evidence_quality_reason": "no source states this",
-    }]})
+    monkeypatch.setattr(pipeline, "json_call", lambda *a, **k: {"scores": [
+        _score_row("f-1", 3, 3, 0, 2, evidence_quality_reason="no source states this"),
+    ]})
     stage_score(run)
     assert run.status == STATUS_INSUFFICIENT_EVIDENCE
     assert run.score_for("f-1").total == 8
@@ -137,6 +149,7 @@ def test_a_high_total_never_overrides_a_failed_evidence_gate(monkeypatch):
 
 def test_fixtures_have_expected_outcomes():
     expected = {
+        "E": STATUS_AWAITING_REVIEW,
         "A": STATUS_AWAITING_REVIEW,
         "B": STATUS_NEEDS_CLARIFICATION,
         "C": STATUS_INSUFFICIENT_EVIDENCE,
@@ -203,9 +216,42 @@ def test_fixture_replay_reaches_final_state():
     assert run.status == STATUS_AWAITING_REVIEW and run.stage_log
 
 
-def test_seller_profile_is_the_fixed_sentence():
-    assert config.SELLER_PROFILE.startswith("We sell software that helps accounts payable")
-    assert len(config.SELLER_CAPABILITIES) == 2
+def test_product_catalogue_shape_and_default():
+    """Three products, each with capabilities, and receipts is the default."""
+    assert list(config.PRODUCTS) == [RECEIPTS, "vendor_onboarding", INVOICE]
+    assert config.DEFAULT_PRODUCT_ID == RECEIPTS
+    assert config.default_product().name == "Expense receipt tracking"
+    # The dropdown shows the default first.
+    assert config.product_choices()[0] == (RECEIPTS, "Expense receipt tracking")
+    for pid, product in config.PRODUCTS.items():
+        assert product.product_id == pid
+        assert product.name and product.description and product.target_users
+        assert product.capabilities, pid
+        assert not product.legacy
+    # An unknown id falls back to the default rather than raising.
+    assert config.product("nope").product_id == RECEIPTS
+    # Capability matching is exact, tolerating case and a trailing stop.
+    inv = config.product(INVOICE)
+    assert inv.matches_capability(INVOICE_CAP.lower() + ".") == INVOICE_CAP
+    assert inv.matches_capability(RECEIPTS_CAP) == ""
+
+
+def test_a_new_run_carries_the_default_product():
+    run = Run(prospect_name="A", company="B")
+    assert run.product.product_id == RECEIPTS and not run.product.legacy
+    assert Run.from_dict(run.to_dict()).product.product_id == RECEIPTS
+
+
+def test_a_payload_without_a_product_is_shown_as_a_legacy_invoice_run():
+    """Runs saved before the dropdown keep their original context."""
+    payload = fixtures.build("A").to_dict()
+    payload.pop("product")
+    run = Run.from_dict(payload)
+    assert run.product.product_id == INVOICE
+    assert run.product.legacy is True
+    # The flag survives a re-save, so approving an old run does not relabel it.
+    assert Run.from_dict(run.to_dict()).product.legacy is True
+    assert "before product choice" in _product_text(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -264,14 +310,13 @@ def test_full_workflow_happy_path(monkeypatch):
             "url": "https://aurora-freight.example/careers/ap-analyst",
             "date": "2026-10-01", "kind": "job posting", "quote": "",
         }]},
-        {"scores": [{"finding_id": "f-1", "product_relevance": 3, "prospect_relevance": 2,
-                     "evidence_quality": 2, "timeliness": 2,
-                     "product_relevance_reason": "names invoice-to-PO matching"}]},
+        {"scores": [_score_row("f-1", 3, 2, 2, 2,
+                               product_relevance_reason="names invoice-to-PO matching")]},
         {"subject": "Your AP analyst posting", "body": "Hi — how does your team handle "
                                                        "mismatches today?"},
     ])
     stages = []
-    run = Run(prospect_name="Maya Iyer", company="Aurora Freight")
+    run = _run_for(INVOICE)
     execute(run, on_stage=lambda r: stages.append(r.stage))
 
     assert run.status == STATUS_AWAITING_REVIEW
@@ -294,7 +339,7 @@ def test_full_workflow_drops_findings_with_uncited_urls(monkeypatch):
             "date": "2026-01-01", "kind": "news", "quote": "We are replacing our ERP.",
         }]},
     ])
-    run = Run(prospect_name="Maya Iyer", company="Aurora Freight")
+    run = _run_for(INVOICE)
     execute(run)
     assert run.status == STATUS_INSUFFICIENT_EVIDENCE
     assert run.findings == []
@@ -309,7 +354,7 @@ def test_full_workflow_pauses_on_ambiguous_identity(monkeypatch):
          "ambiguity": "Two people share this name.",
          "candidates": [{"description": "A", "why": "b", "url": ""}]},
     ])
-    run = Run(prospect_name="Michael Chen", company="Veridian Health")
+    run = _run_for(INVOICE, prospect_name="Michael Chen", company="Veridian Health")
     execute(run)
     assert run.status == STATUS_NEEDS_CLARIFICATION
     assert not run.findings            # research never ran, so nothing was spent
@@ -325,7 +370,7 @@ def test_provider_failure_is_not_insufficient_evidence(monkeypatch):
         raise ResearchProviderError("503 backend unavailable")
 
     monkeypatch.setattr(pipeline, "grounded_search", boom)
-    run = Run(prospect_name="Alina Moreau", company="Castellan Foods")
+    run = _run_for(INVOICE, prospect_name="Alina Moreau", company="Castellan Foods")
     execute(run)
     assert run.status == STATUS_RESEARCH_INCOMPLETE
     assert "503" in run.error
@@ -336,7 +381,7 @@ def test_missing_credentials_reports_research_incomplete(monkeypatch):
     from outreach.pipeline import execute
 
     monkeypatch.setattr(config, "google_api_key", lambda: None)
-    run = Run(prospect_name="Maya Iyer", company="Aurora Freight")
+    run = _run_for(INVOICE)
     execute(run)
     assert run.status == STATUS_RESEARCH_INCOMPLETE
     assert "GOOGLE_API_KEY" in run.error
@@ -346,8 +391,12 @@ def test_missing_credentials_reports_research_incomplete(monkeypatch):
 # Ranked signals: scoring validation, ordering, eligibility gates, and the
 # human switching signal without repeating any research.
 # ---------------------------------------------------------------------------
-def _run_with_findings(claims: list[str]) -> Run:
-    run = Run(prospect_name="Priya Raghavan", company="Northwind Logistics")
+def _run_with_findings(claims: list[str], product_id: str = INVOICE) -> Run:
+    run = Run(
+        prospect_name="Priya Raghavan",
+        company="Northwind Logistics",
+        product=config.product(product_id),
+    )
     run.findings = [
         Finding(
             claim=claim,
@@ -371,7 +420,12 @@ DISTINCT_CLAIMS = [
 ]
 
 
-def _score_row(fid, product, prospect, evidence, timeliness, **reasons):
+def _score_row(fid, product, prospect, evidence, timeliness, *, capability=None, **reasons):
+    """One scoring row, valid by default.
+
+    A product relevance of 2 or 3 has to name a capability and give a reason,
+    so the helper supplies both unless a test is deliberately leaving them out.
+    """
     row = {
         "finding_id": fid,
         "product_relevance": product,
@@ -379,6 +433,16 @@ def _score_row(fid, product, prospect, evidence, timeliness, **reasons):
         "evidence_quality": evidence,
         "timeliness": timeliness,
     }
+    claims_connection = (
+        isinstance(product, (int, float))
+        and not isinstance(product, bool)
+        and product >= MIN_PRODUCT_RELEVANCE
+    )
+    if claims_connection:
+        row["capability"] = INVOICE_CAP if capability is None else capability
+        row.setdefault("product_relevance_reason", "names the task the source describes")
+    elif capability is not None:
+        row["capability"] = capability
     row.update(reasons)
     return row
 
@@ -391,17 +455,20 @@ def test_ranking_orders_by_total_and_sets_recommendation(monkeypatch):
     run = _run_with_findings(DISTINCT_CLAIMS)
     _with_scores(monkeypatch, [
         _score_row("f-1", 3, 2, 2, 2, product_relevance_reason="names invoice-to-PO matching"),
-        _score_row("f-2", 1, 3, 2, 1),
+        _score_row("f-2", 2, 3, 2, 1),
         _score_row("f-3", 0, 1, 2, 2),
     ])
     pipeline.stage_score(run)
 
-    assert run.ranking == ["f-1", "f-2", "f-3"]            # 9, 7, then context only
+    assert run.ranking == ["f-1", "f-2", "f-3"]            # 9, 8, then background only
     assert run.recommended_id == "f-1" and run.active_id == "f-1"
     assert run.score_for("f-1").total == 9
     assert [s.eligibility for s in run.scores] == [ELIGIBLE, ELIGIBLE, CONTEXT_ONLY]
-    assert "9 of 10" in run.selection_reason and "7" in run.selection_reason
+    assert "9 of 10" in run.selection_reason and "8" in run.selection_reason
     assert not run.recommendation_was_overridden()
+    # The capability the model named is kept on the score and reaches the UI.
+    assert run.score_for("f-1").capability == INVOICE_CAP
+    assert run.score_for("f-3").capability == ""
 
 
 def test_context_only_sits_below_eligible_even_with_a_higher_total(monkeypatch):
@@ -423,9 +490,9 @@ def test_tie_breaks_follow_the_documented_order(monkeypatch):
     # All three total 7. f-2 wins on product relevance; f-3 beats f-1 on
     # prospect relevance; f-1 is last despite coming first in research order.
     _with_scores(monkeypatch, [
-        _score_row("f-1", 1, 2, 2, 2),
+        _score_row("f-1", 2, 2, 2, 1),
         _score_row("f-2", 3, 1, 2, 1),
-        _score_row("f-3", 1, 3, 2, 1),
+        _score_row("f-3", 2, 3, 1, 1),
     ])
     pipeline.stage_score(run)
     assert [s.total for s in run.scores] == [7, 7, 7]
@@ -460,7 +527,7 @@ def test_zero_evidence_quality_is_excluded_not_merely_ranked_low(monkeypatch):
     run = _run_with_findings(DISTINCT_CLAIMS[:2])
     _with_scores(monkeypatch, [
         _score_row("f-1", 3, 3, 0, 2),      # 8 points, but unsupported
-        _score_row("f-2", 1, 1, 1, 1),      # 4 points, supported
+        _score_row("f-2", 2, 1, 1, 1),      # 5 points, supported
     ])
     pipeline.stage_score(run)
     assert run.score_for("f-1").eligibility == EXCLUDED
@@ -529,7 +596,7 @@ def test_scoring_invalid_twice_is_research_incomplete_with_a_retry(monkeypatch):
         {"scores": [_score_row("f-1", 9, 9, 9, 9)]},     # out of range
         {"scores": [_score_row("f-2", 1, 1, 1, 1)]},     # unknown id
     ])
-    run = Run(prospect_name="Maya Iyer", company="Aurora Freight")
+    run = _run_for(INVOICE)
     execute(run)
     assert run.status == STATUS_RESEARCH_INCOMPLETE
     assert run.status != STATUS_INSUFFICIENT_EVIDENCE
@@ -547,19 +614,54 @@ def test_score_validation_rejects_bad_shapes():
         ({"scores": [{"finding_id": "f-1", "product_relevance": 1, "prospect_relevance": 1}]}, "missing"),
         ("not json", "not an object"),
     ]
+    product = config.product(INVOICE)
     for payload, why in bad:
         with pytest.raises(pipeline.ScoringFormatError):
-            pipeline._parse_scores(payload, ["f-1"])
+            pipeline._parse_scores(payload, ["f-1"], product)
     # A float that is exactly an integer is accepted; 1.5 is not.
-    ok = pipeline._parse_scores({"scores": [_score_row("f-1", 2.0, 1, 1, 1)]}, ["f-1"])
+    ok = pipeline._parse_scores(
+        {"scores": [_score_row("f-1", 2.0, 1, 1, 1)]}, ["f-1"], product
+    )
     assert ok[0].product_relevance == 2
     with pytest.raises(pipeline.ScoringFormatError):
-        pipeline._parse_scores({"scores": [_score_row("f-1", 1.5, 1, 1, 1)]}, ["f-1"])
+        pipeline._parse_scores(
+            {"scores": [_score_row("f-1", 1.5, 1, 1, 1)]}, ["f-1"], product
+        )
 
 
 def test_missing_score_for_a_candidate_is_rejected():
     with pytest.raises(pipeline.ScoringFormatError):
-        pipeline._parse_scores({"scores": [_score_row("f-1", 1, 1, 1, 1)]}, ["f-1", "f-2"])
+        pipeline._parse_scores(
+            {"scores": [_score_row("f-1", 1, 1, 1, 1)]},
+            ["f-1", "f-2"],
+            config.product(INVOICE),
+        )
+
+
+def test_a_claimed_product_connection_must_name_a_real_capability():
+    """Product relevance of 2 or 3 has to say which capability, and why."""
+    product = config.product(INVOICE)
+
+    def parse(row):
+        return pipeline._parse_scores({"scores": [row]}, ["f-1"], product)
+
+    # No capability named at all.
+    row = _score_row("f-1", 3, 2, 2, 2)
+    row.pop("capability")
+    with pytest.raises(pipeline.ScoringFormatError, match="no capability named"):
+        parse(row)
+    # A capability this product does not have.
+    with pytest.raises(pipeline.ScoringFormatError, match="not a capability"):
+        parse(_score_row("f-1", 3, 2, 2, 2, capability=RECEIPTS_CAP))
+    # Named, but with no reason given.
+    with pytest.raises(pipeline.ScoringFormatError, match="no reason given"):
+        parse(_score_row("f-1", 2, 2, 2, 2, product_relevance_reason=""))
+    # Valid: the capability is kept in the catalogue's own wording.
+    ok = parse(_score_row("f-1", 3, 2, 2, 2, capability=INVOICE_CAP.lower()))
+    assert ok[0].capability == INVOICE_CAP
+    # Below the threshold nothing is claimed, so nothing has to be named.
+    low = parse(_score_row("f-1", 1, 2, 2, 2))
+    assert low[0].capability == "" 
 
 
 # ---- switching signal --------------------------------------------------------
@@ -589,7 +691,7 @@ def test_switching_signal_redrafts_without_repeating_research(monkeypatch):
     assert run.status == STATUS_AWAITING_REVIEW and run.draft.decision == ""
     assert [s.url for s in run.sources] == before_sources
     assert [(s.finding_id, s.total) for s in run.scores] == before_scores
-    assert run.checks[0].name == "Product relevance" and "1 of 3" in run.checks[0].reason
+    assert run.checks[0].name == "Product relevance" and "2 of 3" in run.checks[0].reason
 
 
 def test_switching_to_a_context_only_signal_is_refused():
@@ -653,7 +755,7 @@ def test_demo_flow_switch_approve_reopen(monkeypatch):
 
         assert len(store.list_runs()) == 1                 # still one run
         row = store.list_runs()[0]
-        assert "manual" in row["signal"] and "7 of 10" in row["signal"]
+        assert "manual" in row["signal"] and "8 of 10" in row["signal"]
         assert "reviewer's choice" in row["signal"]
 
         loaded = store.get(run.run_id)
@@ -662,7 +764,7 @@ def test_demo_flow_switch_approve_reopen(monkeypatch):
         assert loaded.recommended_id == "f-1"
         assert loaded.selected_finding().claim.startswith("In a trade-press interview")
         assert "Series B" in loaded.draft.final_body()
-        assert loaded.score_for("f-2").total == 7
+        assert loaded.score_for("f-2").total == 8
         assert loaded.has_ranking()
 
 
@@ -698,10 +800,10 @@ def test_legacy_run_without_ranking_still_opens(monkeypatch):
 
 
 def test_fixture_a_is_demo_ready():
-    """The happy-path fixture must show the ranking the demo talks about."""
+    """The invoice-matching sample must show the ranking the demo talks about."""
     a = fixtures.build("A")
     totals = {s.finding_id: s.total for s in a.scores}
-    assert totals == {"f-1": 9, "f-2": 7, "f-3": 5}
+    assert totals == {"f-1": 9, "f-2": 8, "f-3": 5}
     assert sum(1 for s in a.scores if s.eligibility == ELIGIBLE) == 2
     assert sum(1 for s in a.scores if s.eligibility == CONTEXT_ONLY) == 1
     assert a.recommended_id == "f-1" and a.draft.finding_id == "f-1"
@@ -718,6 +820,315 @@ def test_fixture_c_refuses_to_draft_despite_a_seven_out_of_ten():
     assert all(s.eligibility == CONTEXT_ONLY for s in c.scores)
     assert not c.draft.subject and c.active_id == ""
     assert "cannot buy a product connection" in c.stop_reason
+
+
+
+# ---------------------------------------------------------------------------
+# Multi-product support. Two layers, tested separately: Python's thresholds and
+# ordering are exercised with mocked scores, and the prompts are checked for
+# actually carrying the chosen product.
+# ---------------------------------------------------------------------------
+ACCEPTANCE_CLAIM = (
+    "The finance team follows up with employees about missing expense receipts."
+)
+
+
+def _one_finding_run(product_id: str, claim: str = ACCEPTANCE_CLAIM) -> Run:
+    run = Run(
+        prospect_name="Hannah Weiss",
+        company="Meridian Outfitters",
+        role="Finance Operations Manager",
+        product=config.product(product_id),
+    )
+    run.findings = [
+        Finding(
+            claim=claim, publisher="Meridian Outfitters", url="https://m.example/policy",
+            provenance=PROV_SEARCH_SUMMARY, verification_note="corroborated",
+        )
+    ]
+    pipeline._assign_finding_ids(run)
+    return run
+
+
+def test_the_same_finding_is_usable_for_one_product_and_background_for_another(monkeypatch):
+    """The acceptance example: receipt chasing is a reason to write about
+    receipt tracking, and only background for invoice matching."""
+    # Expense receipt tracking: collecting missing receipts is a listed capability.
+    good = _one_finding_run(RECEIPTS)
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 3, 3, 2, 1, capability=RECEIPTS_CAP,
+                   product_relevance_reason="collecting missing expense receipts, exactly this"),
+    ])
+    pipeline.stage_score(good)
+    assert good.score_for("f-1").eligibility == ELIGIBLE
+    assert good.score_for("f-1").capability == RECEIPTS_CAP
+    assert good.recommended_id == "f-1" and good.status != STATUS_INSUFFICIENT_EVIDENCE
+
+    # Invoice matching: the same sentence gives no invoice-to-PO connection.
+    weak = _one_finding_run(INVOICE)
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 1, 3, 2, 1),
+    ])
+    pipeline.stage_score(weak)
+    score = weak.score_for("f-1")
+    assert score.total == 7                         # a high total, and still unusable
+    assert score.eligibility == CONTEXT_ONLY
+    assert "Invoice matching" in score.eligibility_reason
+    assert weak.status == STATUS_INSUFFICIENT_EVIDENCE
+    assert not weak.draft.subject and weak.active_id == ""
+    assert "Invoice matching" in weak.stop_reason
+    assert "another product" in weak.stop_reason.lower()
+
+
+def test_product_relevance_of_one_is_background_only_not_eligible(monkeypatch):
+    """The threshold moved from 1 to 2, deliberately."""
+    assert MIN_PRODUCT_RELEVANCE == 2
+    run = _run_with_findings(DISTINCT_CLAIMS[:2])
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 1, 3, 2, 2),      # 8 points, broad area only
+        _score_row("f-2", 2, 1, 1, 1),      # 5 points, a related workflow
+    ])
+    pipeline.stage_score(run)
+    assert run.score_for("f-1").eligibility == CONTEXT_ONLY
+    assert run.score_for("f-2").eligibility == ELIGIBLE
+    assert run.recommended_id == "f-2"      # the weaker total is the usable one
+    assert run.ranking == ["f-2", "f-1"]
+
+
+def test_research_scoring_and_drafting_all_receive_the_chosen_product(monkeypatch):
+    """The product has to reach the model, not just the screen."""
+    from outreach.pipeline import execute
+
+    search_prompts: list[str] = []
+    json_prompts: list[str] = []
+
+    class _G:
+        def __init__(self):
+            self.text, self.sources, self.queries = "summary", _fake_sources(), ["q"]
+
+    def fake_search(prompt, *a, **k):
+        search_prompts.append(prompt)
+        return _G()
+
+    answers = [
+        {"status": "confirmed", "confidence_reason": "ok", "ambiguity": "", "candidates": []},
+        {"findings": [{
+            "claim": "Aurora Freight is hiring an AP Analyst to match supplier invoices "
+                     "against purchase orders and escalate mismatches.",
+            "publisher": "Aurora Freight careers",
+            "url": "https://aurora-freight.example/careers/ap-analyst",
+            "date": "2026-10-01", "kind": "job posting", "quote": "",
+        }]},
+        {"scores": [_score_row("f-1", 3, 2, 2, 2)]},
+        {"subject": "Your AP analyst posting", "body": "Hi - how do you handle that today?"},
+    ]
+
+    def fake_json(prompt, *a, **k):
+        json_prompts.append(prompt)
+        return answers.pop(0)
+
+    monkeypatch.setattr(pipeline, "grounded_search", fake_search)
+    monkeypatch.setattr(pipeline, "json_call", fake_json)
+    monkeypatch.setattr(
+        pipeline.verify, "fetch_page_text",
+        lambda url: (None, url, "network disabled in tests"),
+    )
+
+    run = _run_for(INVOICE)
+    execute(run)
+    assert run.status == STATUS_AWAITING_REVIEW
+
+    # Identity is deliberately product-blind; everything after it is not.
+    identity_prompt, research_prompt = search_prompts
+    assert "Invoice matching" not in identity_prompt
+    assert "Invoice matching" in research_prompt
+    assert INVOICE_CAP in research_prompt
+
+    scoring_prompt, draft_prompt = json_prompts[2], json_prompts[3]
+    assert "Invoice matching" in scoring_prompt and INVOICE_CAP in scoring_prompt
+    assert "Invoice matching" in draft_prompt and INVOICE_CAP in draft_prompt
+    # The capability the model named is handed to the drafting call.
+    assert "capability this connects to: " + INVOICE_CAP in draft_prompt
+    # And no other product leaks into any prompt.
+    for prompt in search_prompts[1:] + json_prompts[2:]:
+        assert "Expense receipt tracking" not in prompt
+        assert "Vendor onboarding" not in prompt
+
+
+def test_a_run_keeps_its_product_through_switching_and_reopening(monkeypatch):
+    """Switching signals changes the draft, never the product."""
+    run = fixtures.build("E")
+    assert run.product.product_id == RECEIPTS
+    canned = fixtures.alternate_draft("E", "f-2")
+    pipeline.redraft(run, "f-2", draft_fn=lambda r, f: canned)
+    assert run.product.product_id == RECEIPTS and not run.product.legacy
+    assert run.active_id == "f-2"
+    assert any("Still selling Expense receipt tracking" in e["message"] for e in run.stage_log)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "p.db"
+        monkeypatch.setattr(config, "sqlite_path", lambda: db)
+        monkeypatch.setattr(config, "database_url", lambda: None)
+        from outreach.store import Store
+
+        store = Store()
+        store.save(run)
+        row = store.list_runs()[0]
+        assert row["product"] == "Expense receipt tracking"
+        loaded = store.get(run.run_id)
+        assert loaded.product.product_id == RECEIPTS
+        assert loaded.product.capabilities == run.product.capabilities
+
+
+def test_a_retry_keeps_the_original_product_not_the_form_default(monkeypatch):
+    """Re-running an interrupted run must not silently change what we sell."""
+    from outreach.pipeline import execute
+
+    run = fixtures.build("D")                      # vendor onboarding, interrupted
+    assert run.product.product_id == "vendor_onboarding"
+    run.identity.status = "confirmed"
+
+    captured: list[str] = []
+
+    class _G:
+        def __init__(self):
+            self.text, self.sources, self.queries = "summary", {}, ["q"]
+
+    def fake_search(prompt, *a, **k):
+        captured.append(prompt)
+        return _G()
+
+    monkeypatch.setattr(pipeline, "grounded_search", fake_search)
+    monkeypatch.setattr(pipeline, "json_call", lambda *a, **k: {"findings": []})
+    execute(run, skip_identity=True)
+
+    assert run.product.product_id == "vendor_onboarding"
+    assert "Vendor onboarding" in captured[0]
+    assert "Collecting supplier documents during onboarding" in captured[0]
+
+
+def test_fixture_e_is_demo_ready():
+    """The default product's sample must show the ranking the demo talks about."""
+    e = fixtures.build("E")
+    assert e.product.product_id == RECEIPTS and not e.product.legacy
+    assert {s.finding_id: s.total for s in e.scores} == {"f-1": 9, "f-2": 8, "f-3": 5}
+    assert sum(1 for s in e.scores if s.eligibility == ELIGIBLE) == 2
+    assert sum(1 for s in e.scores if s.eligibility == CONTEXT_ONLY) == 1
+    assert e.recommended_id == "f-1" and e.draft.finding_id == "f-1"
+    # Both usable signals name a capability this product actually has.
+    for s in e.scores:
+        if s.eligibility == ELIGIBLE:
+            assert e.product.matches_capability(s.capability) == RECEIPTS_CAP
+        for key, _, _, _, reason in s.components():
+            assert reason, (s.finding_id, key)
+    # The acceptance example is in there as the runner-up.
+    assert "missing expense receipts" in e.finding_by_id("f-2").claim
+
+
+def test_fixture_e_draft_only_quotes_verified_text():
+    e = fixtures.build("E")
+    f = e.selected_finding()
+    assert f and f.quote_verified
+    _, removed = _strip_unverified_quotes(e.draft.body, allowed_quote=f.quote)
+    assert removed == 0
+    # The runner-up is a summary, so its stored email quotes nothing.
+    alt = fixtures.alternate_draft("E", "f-2")
+    assert chr(34) not in alt.body and chr(8220) not in alt.body
+
+
+def test_every_sample_scenario_declares_its_product():
+    for fid, spec in fixtures.FIXTURES.items():
+        run = fixtures.build(fid)
+        assert spec["product"] == run.product.name, fid
+        assert not run.product.legacy
+        # Scenario names say what the scenario is, not what the code calls it.
+        label = str(spec["label"]).lower()
+        assert "fixture" not in label and "eligib" not in label
+    # The default product leads the list, so the first example matches the form.
+    first = next(iter(fixtures.FIXTURES))
+    assert fixtures.build(first).product.product_id == config.DEFAULT_PRODUCT_ID
+
+
+def test_demo_flow_for_the_receipt_tracking_sample(monkeypatch):
+    """Try the example -> inspect -> switch -> approve -> reopen from history."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "demo_e.db"
+        monkeypatch.setattr(config, "sqlite_path", lambda: db)
+        monkeypatch.setattr(config, "database_url", lambda: None)
+        from outreach.store import Store
+
+        store = Store()
+        run = fixtures.replay("E", step_delay=0.0)
+        store.save(run)
+        assert run.status == STATUS_AWAITING_REVIEW
+
+        # Inspect: the screen can explain why #1 came first, and what it connects to.
+        top = run.score_for(run.recommended_id)
+        assert "9 of 10" in run.selection_reason
+        assert RECEIPTS_CAP.lower() in pipeline.why_it_matters(run, top).lower()
+
+        # Switch to the runner-up, with no model call and no new search.
+        canned = fixtures.alternate_draft("E", "f-2")
+        pipeline.redraft(run, "f-2", draft_fn=lambda r, f: canned)
+        store.save(run)
+
+        # Review and approve.
+        run.draft.edited_body = run.draft.body + "\n\nPS - thanks for the interview."
+        run.draft.decision = "approved"
+        run.draft.decided_at = "2026-11-17T12:00:00+00:00"
+        run.status = STATUS_APPROVED
+        store.save(run)
+
+        assert len(store.list_runs()) == 1
+        row = store.list_runs()[0]
+        assert row["product"] == "Expense receipt tracking"
+        assert "8 of 10" in row["signal"] and "reviewer" in row["signal"]
+
+        # Reopen: same product, same signal, same approved email.
+        loaded = store.get(run.run_id)
+        assert loaded.product.product_id == RECEIPTS
+        assert loaded.status == STATUS_APPROVED
+        assert loaded.active_id == "f-2" and loaded.draft.finding_id == "f-2"
+        assert loaded.recommended_id == "f-1"
+        assert "thanks for the interview" in loaded.draft.final_body()
+        assert loaded.score_for("f-2").capability == RECEIPTS_CAP
+
+
+def test_why_it_matters_names_the_capability_without_inventing_anything():
+    e = fixtures.build("E")
+    score = e.score_for("f-1")
+    sentence = pipeline.why_it_matters(e, score)
+    # Built only from what was already scored and shown: the two reasons, and
+    # the capability the model named.
+    assert score.reasons["product_relevance"].rstrip(".") in sentence
+    assert score.reasons["prospect_relevance"].rstrip(".") in sentence
+    assert RECEIPTS_CAP.lower() in sentence.lower()
+
+    # When the reason does not name the capability, the sentence spells it out.
+    terse = Score(
+        finding_id="f-1", product_relevance=3, prospect_relevance=2,
+        evidence_quality=2, timeliness=2, capability=RECEIPTS_CAP,
+        reasons={"product_relevance": "the posting says so",
+                 "prospect_relevance": "her own function"},
+    )
+    assert "Expense receipt tracking" in pipeline.why_it_matters(e, terse)
+
+    # A background-only finding claims no capability, so it claims no product fit.
+    background = pipeline.why_it_matters(e, e.score_for("f-3"))
+    assert "Expense receipt tracking" not in background
+    assert RECEIPTS_CAP.lower() not in background.lower()
+
+
+def test_no_single_product_wording_survives_in_shared_code():
+    """Rejection messages and prompt templates must not assume one product."""
+    import inspect
+
+    from outreach import prompts
+
+    for module in (pipeline, prompts):
+        src = inspect.getsource(module).lower()
+        for word in ("invoice-to-po", "accounts payable", "three-way"):
+            assert word not in src, (module.__name__, word)
 
 
 if __name__ == "__main__":

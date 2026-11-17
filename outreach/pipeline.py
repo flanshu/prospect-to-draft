@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Callable
 
 from . import prompts, verify
-from .config import MAX_FINDINGS, SELLER_PROFILE
+from .config import MAX_FINDINGS
 from .gemini_client import (
     GroundedResult,
     MissingCredentials,
@@ -26,6 +26,7 @@ from .schema import (
     CONTEXT_ONLY,
     ELIGIBLE,
     EXCLUDED,
+    MIN_PRODUCT_RELEVANCE,
     PROV_SOURCE_TEXT,
     SCORE_COMPONENTS,
     SCORE_MAX,
@@ -38,6 +39,7 @@ from .schema import (
     Draft,
     Finding,
     Identity,
+    Product,
     Run,
     Score,
     Source,
@@ -171,6 +173,7 @@ def stage_research(run: Run) -> None:
                 f"Identity already confirmed: {run.identity.confidence_reason}"
                 if run.identity.confidence_reason else ""
             ),
+            seller=prompts.seller_block(run.product),
             rules=prompts.GROUNDING_RULES,
         )
     )
@@ -290,13 +293,20 @@ def _format_candidates_for_prompt(candidates: list[Finding]) -> str:
     return "\n\n".join(blocks)
 
 
-def _parse_scores(payload: object, expected_ids: list[str]) -> list[Score]:
+def _parse_scores(
+    payload: object, expected_ids: list[str], product: Product
+) -> list[Score]:
     """Validate the model's scoring output. Raises ``ScoringFormatError``.
 
     Rejects a missing, duplicate or unknown finding_id, a missing component, a
-    non-integer and anything outside the rubric's range. There is deliberately
-    no "near enough" path: invalid output is retried once, and then the run
-    stops as "Research incomplete" rather than being quietly repaired.
+    non-integer and anything outside the rubric's range. A finding scored 2 or
+    3 for product relevance must also name one of ``product``'s own listed
+    capabilities and give a reason, so the model cannot assert a product
+    connection without saying which capability it means.
+
+    There is deliberately no "near enough" path: invalid output is retried
+    once, and then the run stops as "Research incomplete" rather than being
+    quietly repaired.
     """
     if not isinstance(payload, dict):
         raise ScoringFormatError("the scoring call did not return a JSON object")
@@ -336,7 +346,33 @@ def _parse_scores(payload: object, expected_ids: list[str]) -> list[Score]:
             values[key] = int(raw)
             reasons[key] = str(row.get(f"{key}_reason", "")).strip()
 
-        seen[fid] = Score(finding_id=fid, reasons=reasons, **values)
+        # A claimed product connection has to name the capability it rests on.
+        capability = str(row.get("capability", "") or "").strip()
+        if values["product_relevance"] >= MIN_PRODUCT_RELEVANCE:
+            if not capability:
+                raise ScoringFormatError(
+                    f"{fid}: product relevance {values['product_relevance']} with no "
+                    "capability named"
+                )
+            matched = product.matches_capability(capability)
+            if not matched:
+                raise ScoringFormatError(
+                    f"{fid}: {capability!r} is not a capability of "
+                    f"{product.name}"
+                )
+            capability = matched
+            if not reasons["product_relevance"]:
+                raise ScoringFormatError(
+                    f"{fid}: product relevance {values['product_relevance']} with no "
+                    "reason given"
+                )
+        else:
+            # Below the threshold nothing is claimed, so nothing is named.
+            capability = ""
+
+        seen[fid] = Score(
+            finding_id=fid, reasons=reasons, capability=capability, **values
+        )
 
     missing = [fid for fid in expected if fid not in seen]
     if missing:
@@ -363,8 +399,11 @@ def _apply_eligibility(run: Run, scores: list[Score]) -> None:
     """Decide what each scored finding may be used for.
 
     Verification comes first: a model score can never promote a finding whose
-    source did not support the claim.
+    source did not support the claim. After that the gates are about the
+    selected product, so the same finding can be usable for one product and
+    background only for another.
     """
+    product = run.product
     for score in scores:
         finding = run.finding_by_id(score.finding_id)
         if finding is None:
@@ -383,18 +422,23 @@ def _apply_eligibility(run: Run, scores: list[Score]) -> None:
                 "source, so it is excluded from ranking and drafting."
             )
             continue
-        if score.product_relevance == 0:
+        if score.product_relevance < MIN_PRODUCT_RELEVANCE:
             score.eligibility = CONTEXT_ONLY
             score.eligibility_reason = (
-                "No demonstrated connection to invoice-to-PO matching or discrepancy "
-                "review, so it is context only and cannot generate a draft."
+                f"Product relevance {score.product_relevance} of 3: the source does not "
+                f"describe a task {product.name} handles"
+                + (
+                    f" — {score.reasons['product_relevance'].strip().rstrip('.')}"
+                    if score.reasons.get("product_relevance") else ""
+                )
+                + ". Useful background, but not something to write about."
             )
             continue
         if score.prospect_relevance == 0:
             score.eligibility = CONTEXT_ONLY
             score.eligibility_reason = (
-                "Nothing shows this concerns the prospect's own work, so it is context "
-                "only and cannot generate a draft."
+                "Nothing shows this concerns the prospect's own work, so it is "
+                "background only and cannot generate a draft."
             )
             continue
         score.eligibility = ELIGIBLE
@@ -484,12 +528,31 @@ def winner_rationale(run: Run) -> str:
             f"It scores {top.total} of {SCORE_MAX} against {runner.total} for the "
             f"runner-up (“{runner_claim}”)."
         )
-    detail = f" — {best[4]}" if best[4] else ""
+    detail = f" — {best[4].rstrip('.')}" if best[4] else ""
     return (
         f"It scores {top.total} of {SCORE_MAX} against {runner.total} for the runner-up "
         f"(“{runner_claim}”), mainly on {best[1].lower()}: {best[2]} against "
         f"{best[3]}{detail}."
     )
+
+
+def why_it_matters(run: Run, score: Score) -> str:
+    """One plain sentence tying the finding to this person and one capability.
+
+    Built from the model's own two reasons plus the capability it named, so it
+    asserts nothing that was not already scored and shown.
+    """
+    product = score.reasons.get("product_relevance", "").strip().rstrip(".")
+    prospect = score.reasons.get("prospect_relevance", "").strip().rstrip(".")
+    clauses = [c for c in (product, prospect) if c]
+    if not clauses:
+        return ""
+    sentence = "; ".join(clauses) + "."
+    # The model is asked to name the capability in its reason, so only spell it
+    # out again when it did not.
+    if score.capability and score.capability.lower() not in sentence.lower():
+        sentence += f" That is one thing {run.product.name} does: {score.capability.lower()}."
+    return sentence
 
 
 def stage_score(run: Run) -> None:
@@ -498,11 +561,12 @@ def stage_score(run: Run) -> None:
     candidates = [f for f in run.findings if verify.is_usable(f)]
     run.log(
         "Signal selection",
-        f"Scoring {len(candidates)} verified finding(s) against the 10-point rubric.",
+        f"Scoring {len(candidates)} verified finding(s) against the 10-point rubric "
+        f"for {run.product.name}.",
     )
 
     prompt = prompts.SIGNAL_SCORE.format(
-        seller=prompts.SELLER_BLOCK,
+        seller=prompts.seller_block(run.product),
         name=run.prospect_name,
         role_line=_role_line(run),
         company=run.company,
@@ -514,7 +578,7 @@ def stage_score(run: Run) -> None:
     first_error = ""
     for attempt in (1, 2):
         try:
-            scores = _parse_scores(json_call(prompt), expected_ids)
+            scores = _parse_scores(json_call(prompt), expected_ids, run.product)
             break
         except ScoringFormatError as exc:
             first_error = first_error or str(exc)
@@ -595,9 +659,10 @@ def stage_score(run: Run) -> None:
         if excluded:
             details.append(f"{len(excluded)} finding(s) were excluded before ranking")
         run.stop_reason = (
-            "Research completed and the findings were scored, but no finding is both "
-            "connected to invoice-to-PO matching or discrepancy review and connected "
-            "to this person's own work, so there is no honest reason to write. "
+            f"Research completed and the findings were scored for {run.product.name}, "
+            "but none of them both describes a task this product handles and concerns "
+            "this person's own work, so there is no honest reason to write about it. "
+            "Another product may fit this prospect better. "
             + (". ".join(details) + "." if details else "")
         ).strip()
         run.log(
@@ -635,12 +700,21 @@ def stage_draft(run: Run, *, chosen_by_reviewer: bool = False) -> None:
             "generate a draft: " + score.eligibility_reason
         )
 
-    run.log("Draft", "Writing a first-contact email from the selected evidence.")
+    run.log(
+        "Draft",
+        "Writing a first-contact email from the selected evidence, for "
+        f"{run.product.name}.",
+    )
     quotable = finding.quote_verified and finding.provenance == PROV_SOURCE_TEXT and finding.quote
+    capability = (score.capability if score is not None else "") or ""
 
     payload = json_call(
         prompts.DRAFT_EMAIL.format(
-            seller=prompts.SELLER_BLOCK,
+            seller=prompts.seller_block(run.product),
+            capability_line=(
+                f"  The capability this connects to: {capability}\n"
+                if capability else ""
+            ),
             name=run.prospect_name,
             role_line=_role_line(run),
             company=run.company,
@@ -747,7 +821,8 @@ def redraft(run: Run, finding_id: str, *, draft_fn=None) -> Run:
     run.log(
         "Draft",
         f"Salesperson switched to {finding_id} ({score.total} of {SCORE_MAX}). "
-        "Reusing the saved research and scores — no new search.",
+        f"Still selling {run.product.name}; reusing the saved research and scores "
+        "— no new search.",
     )
     try:
         if draft_fn is not None:
@@ -855,5 +930,6 @@ def execute(run: Run, on_stage: OnStage | None = None, *, skip_identity: bool = 
         return run
 
 
-def seller_profile() -> str:
-    return SELLER_PROFILE
+def seller_profile(run: Run) -> str:
+    """The one-sentence description of what this run is selling."""
+    return run.product.description

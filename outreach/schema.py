@@ -57,9 +57,69 @@ ELIGIBLE = "eligible"            # can be selected and can generate a draft
 CONTEXT_ONLY = "context_only"    # real, but no product or prospect connection
 EXCLUDED = "excluded"            # unsupported/contradicted, or a duplicate
 
+# A finding needs at least this much product relevance to be drafted from.
+# 2 means "a related workflow is described, but the exact task is unclear" --
+# below that the source shows no more than the same broad business area, which
+# is not a reason to write to someone about this product.
+MIN_PRODUCT_RELEVANCE = 2
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@dataclass
+class Product:
+    """One thing the salesperson can sell, and the only claims allowed for it.
+
+    A run stores a snapshot of the product it was researched for, so reopening
+    it later shows the same offering even if the catalogue has moved on and
+    even if a different product is selected on the new-run form.
+    """
+
+    product_id: str
+    name: str
+    target_users: str = ""
+    description: str = ""
+    capabilities: list[str] = field(default_factory=list)
+    # True only for runs saved before product selection existed.
+    legacy: bool = False
+
+    def capability_lines(self) -> str:
+        return "\n".join(f"- {c}" for c in self.capabilities)
+
+    def matches_capability(self, text: str) -> str:
+        """The listed capability ``text`` names, or "" if it names none."""
+        wanted = " ".join((text or "").split()).strip().lower().rstrip(".")
+        if not wanted:
+            return ""
+        for cap in self.capabilities:
+            if " ".join(cap.split()).strip().lower().rstrip(".") == wanted:
+                return cap
+        return ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Product":
+        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        payload = {k: v for k, v in (d or {}).items() if k in known}
+        payload["capabilities"] = list(payload.get("capabilities") or [])
+        return cls(**payload)
+
+
+def _default_product() -> Product:
+    # Imported lazily: config owns the catalogue and imports this module.
+    from .config import default_product
+
+    return default_product()
+
+
+def _legacy_product() -> Product:
+    from .config import legacy_product
+
+    return legacy_product()
 
 
 @dataclass
@@ -128,6 +188,10 @@ class Score:
     timeliness: int = 0
     # component key -> the model's short reason for that score
     reasons: dict[str, str] = field(default_factory=dict)
+    # Which of the selected product's listed capabilities this finding connects
+    # to. Required when product relevance is 2 or 3, and validated against the
+    # run's own product so the model cannot name a capability we do not sell.
+    capability: str = ""
     eligibility: str = ELIGIBLE
     eligibility_reason: str = ""
 
@@ -238,6 +302,10 @@ class Run:
     role: str = ""
     company_website: str = ""
     profile_url: str = ""
+
+    # What this run is selling. Chosen once, at run creation, and never changed
+    # afterwards: research, scoring, drafting and history all read it from here.
+    product: Product = field(default_factory=_default_product)
 
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     created_at: str = field(default_factory=_now)
@@ -366,6 +434,7 @@ class Run:
             "role": self.role,
             "company_website": self.company_website,
             "profile_url": self.profile_url,
+            "product": self.product.to_dict(),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "status": self.status,
@@ -396,6 +465,12 @@ class Run:
             role=d.get("role", ""),
             company_website=d.get("company_website", ""),
             profile_url=d.get("profile_url", ""),
+        )
+        # A payload with no product predates product selection: it was an
+        # invoice-matching run, and it is shown that way rather than rescored.
+        stored_product = d.get("product")
+        run.product = (
+            Product.from_dict(stored_product) if stored_product else _legacy_product()
         )
         run.run_id = d.get("run_id", run.run_id)
         run.created_at = d.get("created_at", run.created_at)

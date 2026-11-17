@@ -2,17 +2,37 @@
 
 **ASA Case Study · PS-3 (GTM)**
 
-A salesperson types a prospect's name and company. The app researches public
-information with Gemini + Google Search, confirms it has the right person,
-collects up to three credible findings, picks **one** signal and explains why,
-drafts a short first-contact email from that evidence, and stops for human
-review. **No email is ever sent.**
+A salesperson picks **one product**, then types a prospect's name and company.
+The app researches public information with Gemini + Google Search, confirms it
+has the right person, collects up to three credible findings, scores each of
+them against the chosen product, drafts a short first-contact email from the
+strongest one, and stops for human review. **No email is ever sent.**
 
-The seller profile is fixed for the prototype and shown in the sidebar, so a
-reviewer can always see the yardstick a finding was judged against:
+### The product catalogue
 
-> We sell software that helps accounts payable teams match supplier invoices to
-> purchase orders and route discrepancies to a reviewer.
+Three fictional offerings, in `outreach/config.py`. The salesperson chooses one
+per run, and that choice drives the research question, the scoring, the draft
+and the history row. The capability lists are the complete and only claims the
+app may make about each one.
+
+| Product | Sold to | What it does |
+| --- | --- | --- |
+| **Expense receipt tracking** (default) | finance teams | Collect missing employee expense receipts, send reminders, track outstanding receipts |
+| **Vendor onboarding** | procurement teams | Collect supplier documents, flag missing information, track onboarding approval |
+| **Invoice matching** | accounts payable teams | Compare supplier invoices with purchase orders, route quantity or price discrepancies for review |
+
+These are examples written for the assignment. They are not attributed to any
+real company.
+
+**The same finding can be a strong reason to write about one product and mere
+background for another.** "The finance team follows up with employees about
+missing expense receipts" is a direct hit for receipt tracking and says nothing
+about invoice-to-PO matching — so for invoice matching it is shown, scored, and
+refused as a basis for a draft.
+
+**Changing product starts a new run.** It changes what we search for and how
+every finding is scored, so a run keeps the product it was created with —
+through retries, clarification, switching signals and reopening from history.
 
 ---
 
@@ -74,7 +94,7 @@ python -m pytest tests -q
 | --- | --- | --- |
 | 1 · Identity | One grounded search for this person at this company; a judging call decides `confirmed` / `ambiguous` / `not_found`. | `outreach/pipeline.py: stage_identity` |
 | 2 · Research | Grounded search over company pages, job postings, announcements, interviews. Up to three findings extracted, each tied to a cited URL, then **verified**. | `stage_research` |
-| 3 · Signal | Every verified finding is scored individually against a fixed 10-point rubric in **one** model call, then ranked, tie-broken and gated in Python. | `stage_score`, `rank_scores` |
+| 3 · Signal | Every verified finding is scored individually against the run's product on a fixed 10-point rubric, in **one** model call, then ranked, tie-broken and gated in Python. | `stage_score`, `rank_scores` |
 | 4 · Draft | A subject and short body built from the top-ranked eligible signal only. | `stage_draft` |
 | 5 · Human review | Edit, approve, reject — or switch to another eligible signal, which rewrites the draft from that evidence without repeating any research. | `app.py`, `pipeline.redraft` |
 
@@ -87,7 +107,7 @@ python -m pytest tests -q
 | `Research incomplete` | The search provider failed or is not configured. We do **not** know what the evidence says. Offers retry. |
 | `Awaiting review` → `Approved` / `Rejected` | A draft exists and a human has it. |
 
-### Ranked signals — the 10-point rubric
+### Scoring a signal — the 10-point rubric
 
 Each candidate finding is scored on its own. The model returns four integers and
 a short reason for each, keyed by the finding's stable `finding_id`; Python
@@ -95,7 +115,7 @@ validates, totals, sorts and decides eligibility.
 
 | Component | Range | 0 means | top of range means |
 | --- | --- | --- | --- |
-| Product relevance | 0–3 | no demonstrated connection to the offer | explicitly concerns invoice-to-PO matching or discrepancy review |
+| Product relevance | 0–3 | no demonstrated connection to a listed capability | the source explicitly describes a task this product handles |
 | Prospect relevance | 0–3 | no demonstrated connection to the person's work | the person owns or publicly discussed this specific initiative |
 | Evidence quality | 0–2 | unsupported or contradicted | a direct source — the company's own posting, or the person's own words |
 | Timeliness | 0–2 | stale or undated | demonstrably current, such as an open role |
@@ -117,15 +137,26 @@ What Python decides, not the model:
   | --- | --- |
   | Failed source verification | **Excluded** from ranking and drafting. A model score can never promote it. |
   | Evidence quality 0 | **Excluded** — unsupported or contradicted. |
-  | Product relevance 0, or prospect relevance 0 | **Context only** — shown with its score, cannot generate a draft. |
+  | Product relevance **below 2**, or prospect relevance 0 | **Background only** — shown with its score, cannot generate a draft. |
   | Same event as a higher-scoring finding | **Excluded** as a duplicate, so one announcement cannot occupy two ranks. |
-  | No eligible signal at all | `Insufficient evidence`, listing the context-only findings and their scores. |
+  | No eligible signal at all | `Insufficient evidence`, explaining the gap in terms of the chosen product. |
 
-- **Order.** Eligible signals by total descending; ties broken on product
+  The minimum product relevance of **2** is deliberate, and stricter than the
+  earlier threshold of 1. A score of 1 means "same broad business area only" —
+  a finance job title, a payables team, a procurement function. That is not a
+  reason to write to someone about a specific product, so it is background.
+
+- **A claimed connection has to be named.** Product relevance of 2 or 3 is only
+  accepted when the model also returns one of *this* product's listed
+  capabilities, copied exactly, plus a reason. A capability we do not sell, or
+  a bare score with no reason, is rejected as malformed — the model cannot
+  assert a product fit without saying which capability it means.
+
+- **Order.** Usable signals by total descending; ties broken on product
   relevance, then prospect relevance, then evidence quality, then timeliness,
-  then the original research order. Context-only and excluded findings sit below
-  every eligible one **however high their raw total** — fixture C's best finding
-  scores 7 of 10 and still produces no draft.
+  then the original research order. Background-only and excluded findings sit
+  below every usable one **however high their raw total** — the *No relevant
+  finding* sample's best finding scores 7 of 10 and still produces no draft.
 
 ### Switching signal
 
@@ -165,27 +196,38 @@ Additional guards:
 - An unresolved identity stops the run before any research spend, and a finding
   scored 0 for evidence quality is excluded from ranking and from drafting. A
   score is a review aid, never a buying probability: 8 of 10 with unsupported
-  evidence produces no draft, and 7 of 10 with no product connection is context
-  only.
+  evidence produces no draft, and 7 of 10 with no connection to the chosen
+  product is background only.
+- Identity confirmation is deliberately **product-blind**, and so is finding
+  extraction: what we sell steers where the search looks, never what a source
+  is recorded as saying. Only the scoring step judges a finding against the
+  product.
 - The draft may note a fact and ask a question about it. It may not assert that
   the company has a backlog, loses money, or wants software — that rule is in
   the drafting prompt (`outreach/prompts.py`).
 
 ---
 
-## 3 · Rehearsal fixtures
+## 3 · Sample scenarios
 
-Four labelled scenarios in `outreach/fixtures.py`. They run **no search and no
-model call**, are stored with `mode = "fixture"`, and are labelled 🧪 in the run
-view and in history. The people, companies and URLs are fictional. **A fixture
-run is never evidence that live integration works.**
+Five scenarios in `outreach/fixtures.py`, shown in the interface as **"Try an
+example"** and labelled *Sample data · no live search*. They run **no search and
+no model call**, are stored with `mode = "fixture"`, and carry their product
+like any other run. The people, companies and URLs are fictional. **A sample run
+is never evidence that live integration works.**
 
-| Fixture | Scenario | Expected status |
-| --- | --- | --- |
-| A | Happy path — Priya Raghavan, Northwind Logistics. Three scored findings: the AP posting at **9/10**, her own interview at **7/10**, a funding round at **5/10, context only**. Switching to the runner-up uses a stored draft, so it works with no API key. | `Awaiting review` |
-| B | Ambiguous identity — Michael Chen, Veridian Health | `Needs clarification` |
-| C | Weak signal — Daniel Okafor, Lumenbridge Studios. The best finding scores **7/10** and is still context only. | `Insufficient evidence` |
-| D | Provider failure — Alina Moreau, Castellan Foods | `Research incomplete` |
+Each scenario declares only its findings and the raw scores a model might
+return; eligibility, ranking, the checks and the "why it came first" sentence
+are computed by the real pipeline, so a sample cannot display a verdict the live
+code would not reach.
+
+| Scenario | Product | What it shows | Ends at |
+| --- | --- | --- | --- |
+| **Strong match** | Expense receipt tracking | Hannah Weiss, Meridian Outfitters. An open expense role naming receipt chasing at **9/10**, her own interview at **8/10**, a new distribution centre at **5/10, background only**. Switching to the runner-up uses a stored draft, so it works with no API key. | `Awaiting review` |
+| **Strong match** | Invoice matching | Priya Raghavan, Northwind Logistics. A verified AP posting at **9/10**, her interview at **8/10**, a funding round at **5/10, background only**. | `Awaiting review` |
+| **Two people with the same name** | Expense receipt tracking | Michael Chen, Veridian Health. The run pauses before any research spend. | `Needs clarification` |
+| **No relevant finding** | Invoice matching | Daniel Okafor, Lumenbridge Studios. The best finding scores **7/10** and is still background only. | `Insufficient evidence` |
+| **Research interrupted** | Vendor onboarding | Alina Moreau, Castellan Foods. A retryable provider failure, not a conclusion. | `Research incomplete` |
 
 The submitted app also accepts a new prospect and runs the real research path.
 
@@ -207,7 +249,14 @@ Saves are upserts keyed on `run_id`, so editing or approving a draft updates the
 same row. Approving, saving edits, rejecting or switching signal **never**
 triggers another search and never creates a second run.
 
-The payload carries the component scores and their reasons, the ranking, the
+The payload carries a **snapshot of the product** — its id, name, who it is
+sold to, its description and its capability list — so reopening a run shows the
+offering it was actually researched for, even if the catalogue has since moved
+on. A payload with no product predates product selection; those runs were all
+invoice-matching runs and are shown as *Invoice matching (before product
+choice)* rather than being relabelled or rescored.
+
+The payload also carries the component scores and their reasons, the ranking, the
 recommended `finding_id`, the reviewer's active `finding_id` and the draft's own
 `finding_id`. Reopening a run from history therefore restores exactly what the
 reviewer saw, with **no model call**. A run saved before ranking existed still
@@ -259,54 +308,93 @@ Light background, one accent colour (`#2563EB`) reserved for the primary action,
 and every status carries a **text label**, never colour alone. The theme lives in
 `.streamlit/config.toml`; the layout CSS is at the top of `app.py`.
 
-**Research prospect** answers three questions in reading order:
+It is written for a salesperson who knows their customers and has never heard
+the words *fixture*, *grounding* or *eligibility*. Internal status values, stage
+names and score keys are unchanged — storage, tests and the pipeline all still
+use them — but nothing on screen does:
 
-1. *What did we learn?* — prospect name, role and company sit above a compact
-   five-stage indicator that updates as identity, research, selection and
-   drafting actually execute.
-2. *Where did we find it, and why does it matter?* — the left column leads with
-   the signal under review: its score out of 10, its rank, and whether it is the
-   app's recommendation or your own choice, then the claim, then publisher ·
-   date · clickable source · text status, the verified excerpt if there is one,
-   and one sentence on why it ranked first. Below it, **Ranked signals** lists
-   every scored finding in order with its rank, total, eligibility label, source
-   and component scores — reasons collapsed, open by default on the top signal —
-   and a **Use this signal** button on each eligible alternative.
-3. *Does the email use it accurately?* — the right column holds the editable
-   subject and body with **Approve draft** / **Reject draft** directly beneath,
-   and the evidence stays on screen while you edit. After a decision the editor
-   locks and shows the saved review status.
+| Internally | On screen |
+| --- | --- |
+| fixture | Sample scenario · *Sample data · no live search* |
+| human review (HITL) | Your review |
+| `eligible` | Can use in draft |
+| `context_only` | Background only, with the reason |
+| `Insufficient evidence` | No strong signal found, with what was missing |
+| `Research incomplete` | Research interrupted, with a *Try again* button |
+| `Awaiting review` | Needs your review |
+| product / prospect relevance, evidence quality, timeliness | Product fit · Relevant to their role · Source quality · Timing |
 
-Exception states replace the two columns with an actionable panel:
+Model names, database details, run ids and raw provider errors live in one
+**Technical details** expander at the foot of every result.
 
-- **Needs clarification** — the possible matches, each with its source link, then
-  a field for a profile URL or a correction, and a primary *Confirm and continue*.
-- **Insufficient evidence** — the ranked list of everything that was checked,
-  each with its score and the reason it is context only or excluded, so it is
-  clear why no draft was produced.
-- **Research incomplete** — the provider error and a *Retry this run* button.
+**Research a prospect** is the main screen. The product selector, prospect name
+and company sit together, with the chosen product's description directly
+beneath the selector; role, website and profile link are grouped under
+*Additional details*; the primary button is **Research prospect**. The sample
+scenarios sit to the side under *Try an example*, each labelled with its
+product. When live research is unavailable the screen says exactly that — "Live
+research is unavailable. You can still try an example." — and the cause and
+setup steps go in an expander.
 
-**Run history** is one row per run: prospect (and role), company, the active
-signal as a full sentence with its score (and "reviewer's choice" when it is not
-the app's pick), status, date and live/fixture mode. Selecting a row
-reopens the saved result in place, review controls included.
+As a run executes, the stage strip reads **Confirming identity · Finding
+sources · Comparing signals · Preparing draft · Your review**, with the real
+stage message underneath.
 
-On screens under 900px the columns stack, signal above draft.
+A finished run answers four questions in reading order:
+
+1. *Who did we research, and for what?* — a compact header: prospect, role,
+   company, the product, live or sample, and the review status.
+2. *What did we find?* — the left column leads with the finding itself as the
+   largest text on the page, then publisher · date · clickable source · whether
+   it can be quoted, then the verified excerpt when there is one. A paraphrase
+   is labelled *Summary of the source*.
+3. *Why does it matter for this product?* — one plain sentence built from the
+   scores the model gave and the capability it named, with **Signal strength ·
+   9/10** beside it and the four parts of the score as chips. The detail sits
+   under *How this was scored*. Below that, **Other signals we found** ranks
+   everything, marks what can and cannot be used, keeps *Our pick* and *Your
+   pick* distinguishable, and puts **Use this signal** on each usable
+   alternative.
+4. *What can I do next?* — the right column holds the editable subject and
+   email with **Approve draft**, **Save edits** and **Reject draft** beneath it.
+   The evidence stays on screen while you edit; after an action the editor locks
+   and says what was saved and when.
+
+The screens that produce no draft each say what happened and what to do next:
+
+- **Confirm who you mean** — the possible matches with their sources, a line
+  like "We found 3 possible matches for this name. Add a profile link to confirm
+  the right person", then a field for a link or a correction.
+- **No strong signal found** — everything that was checked, each with its score
+  and the reason it is background only, plus the suggestion to try the prospect
+  again with a different product.
+- **Research interrupted** — kept firmly distinct from the above: nothing was
+  concluded, and there is a **Try again** button. The raw error is in Technical
+  details.
+
+**Past runs** is one row per run: prospect (and role), company, **Selling**, what
+we used (the signal as a full sentence with its score, and "reviewer's choice"
+when it is not our pick), status with live/sample beneath, and the date.
+Selecting a row reopens the saved result in place — same product, same evidence,
+same reviewed email — with no model call.
+
+On screens under 900px the columns stack: what we found, then the other signals,
+then the email, with the review controls full width.
 
 ## 8 · Layout
 
 ```
 app.py                       Streamlit UI — two views, live stages, review controls
 outreach/
-  config.py                  Seller profile, models, secrets/env loading
+  config.py                  Product catalogue, models, secrets/env loading
   gemini_client.py           Grounded search + source collection + JSON calls
   prompts.py                 Every prompt, in one readable place
   pipeline.py                The four stages, scoring/ranking, and redraft
   verify.py                  Page fetch, quote matching, provenance decisions
-  schema.py                  Run / Finding / Score / Source / Check / Draft + statuses
+  schema.py                  Run / Product / Finding / Score / Source / Check / Draft + statuses
   store.py                   SQLite and Postgres persistence
-  fixtures.py                Four rehearsal scenarios
-tests/test_offline.py        39 offline checks (no network, no API key)
+  fixtures.py                Five sample scenarios, one per outcome
+tests/test_offline.py        53 offline checks (no network, no API key)
 .streamlit/config.toml       Light theme and accent colour
 ```
 
@@ -317,4 +405,6 @@ tests/test_offline.py        39 offline checks (no network, no API key)
   claims fall back to grounding-segment corroboration and are never quotable.
 - Research is capped at a few grounded calls per run to stay demo-fast; depth is
   traded for latency on purpose.
-- Fixture data is fictional and the fixture URLs do not resolve.
+- Sample-scenario data is fictional and its URLs do not resolve.
+- The three products are examples written for this assignment, with no real
+  company behind them.

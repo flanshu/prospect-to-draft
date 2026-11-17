@@ -175,6 +175,7 @@ class Store:
                     payload = {}
             payload = payload or {}
             row["role"] = payload.get("role", "")
+            row["product"] = _product_text(payload)
             row["signal"] = _signal_text(payload)
             out.append(row)
         return out
@@ -197,6 +198,23 @@ class Store:
         with self._conn() as conn:
             cur = conn.cursor()
             cur.execute(f"DELETE FROM runs WHERE run_id = {ph}", (run_id,))
+
+
+def _product_text(payload: dict[str, Any]) -> str:
+    """The product this run was researched for, read from the stored payload.
+
+    A payload with no product predates product selection; those runs were all
+    invoice-matching runs and are labelled as such rather than left blank.
+    """
+    stored = payload.get("product") or {}
+    name = str(stored.get("name") or "").strip()
+    if not name:
+        from . import config
+
+        return config.PRODUCTS[config.LEGACY_PRODUCT_ID].name + " (before product choice)"
+    if stored.get("legacy"):
+        return name + " (before product choice)"
+    return name
 
 
 def _signal_text(payload: dict[str, Any]) -> str:

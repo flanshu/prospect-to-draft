@@ -1,8 +1,14 @@
-"""Prompt templates. Kept in one place so the reviewer can read the rules."""
+"""Prompt templates. Kept in one place so the reviewer can read the rules.
+
+Every prompt that needs to know what is being sold takes a ``Product`` and
+renders it through ``seller_block``. Nothing here hard-codes an offering, so
+selecting a different product on the form genuinely changes the research
+question, the scoring and the draft.
+"""
 
 from __future__ import annotations
 
-from .config import SELLER_CAPABILITIES, SELLER_PROFILE
+from .schema import Product
 
 GROUNDING_RULES = """
 Hard rules:
@@ -13,19 +19,28 @@ Hard rules:
 - Do not speculate about what a company needs, buys, or struggles with.
 """.strip()
 
-SELLER_BLOCK = f"""
-What we sell (this is the complete and only description of our product):
-"{SELLER_PROFILE}"
 
-Our stated capabilities, in full:
-- {SELLER_CAPABILITIES[0]}
-- {SELLER_CAPABILITIES[1]}
+def seller_block(product: Product) -> str:
+    """The complete, and only, description of what we are selling this run."""
+    return f"""
+What we sell on this run (this is the complete and only description):
+  Product: {product.name}
+  Sold to: {product.target_users}
+  What it does: "{product.description}"
 
-You must not attribute any other capability, customer, metric, or saving to us.
+Its capabilities, in full — there are no others:
+{product.capability_lines()}
+
+You must not attribute any other capability, customer, metric, or saving to it,
+and you must not refer to any other product.
 """.strip()
+
 
 # ---------------------------------------------------------------------------
 # Stage 1 -- identity
+#
+# Identity is deliberately product-blind: the question is only whether we have
+# found the right human being. What they might want comes later.
 # ---------------------------------------------------------------------------
 IDENTITY_SEARCH = """
 Find public evidence about who this person is and where they currently work.
@@ -81,6 +96,10 @@ Use at most 4 candidates. Only include a url that appears in the source list.
 
 # ---------------------------------------------------------------------------
 # Stage 2 -- candidate signals
+#
+# The SEARCH prompt is product-aware: knowing what we sell is what makes the
+# search look in useful places. The EXTRACT prompt is deliberately NOT, so the
+# facts we keep are shaped by the sources rather than by what we hope to find.
 # ---------------------------------------------------------------------------
 RESEARCH_SEARCH = """
 Research what this person and their team are publicly doing right now.
@@ -91,13 +110,22 @@ Company: {company}
 {hints}
 {identity_note}
 
+{seller}
+
 Look for, in this order of usefulness:
-1. The person's own public statements -- interviews, podcasts, conference talks,
-   bylined posts, quotes in press releases.
-2. Evidence of what their team is doing -- active job postings for their team,
-   official company pages about their function, product or process announcements.
-3. Company news that plausibly touches their responsibilities -- funding,
+1. Public evidence about the specific work our capabilities above touch — the
+   team's own process pages, policies, active job postings describing those
+   tasks, or the person describing that work themselves.
+2. The person's own public statements more generally — interviews, podcasts,
+   conference talks, bylined posts, quotes in press releases.
+3. Evidence of what their team is doing — active job postings for their team,
+   official company pages about their function, process announcements.
+4. Company news that plausibly touches their responsibilities — funding,
    expansion, acquisitions, new systems, new markets, new entities.
+
+Knowing what we sell tells you where to look. It does not tell you what is
+true: do not report that this company does something because our product would
+suit them. Report only what a source says.
 
 Prefer official company pages, active job postings, announcements and interviews.
 For each thing you find, state: the specific fact, who published it, the URL, and
@@ -122,7 +150,11 @@ Sources the search cited (use these URLs and nothing else):
 {sources}
 
 A good finding is one concrete, checkable fact. Bad: "the company is growing".
-Good: "Posted a job opening for an Accounts Payable Specialist in Pune on 3 March".
+Good: "Posted a job opening for an Expense Operations Analyst in Pune on 3 March".
+
+Record what the sources say. Do not judge how useful a fact is, do not rank the
+findings, and do not leave out a fact because it looks unhelpful — something
+else decides that later.
 
 Return JSON only:
 {{
@@ -150,11 +182,13 @@ Rules:
 # Stage 3 -- score every candidate signal against a fixed rubric
 #
 # One structured call scores all candidates at once, keyed by finding_id.
-# Python validates the ids and ranges, totals the scores and sorts; the model
-# never decides the winner and never sees a running total.
+# Python validates the ids, the ranges and the named capability, totals the
+# scores and sorts; the model never decides the winner and never sees a
+# running total.
 # ---------------------------------------------------------------------------
 SIGNAL_SCORE = """
-Score each candidate finding below as a reason to contact this prospect now.
+Score each candidate finding below as a reason to contact this prospect now
+about this one product.
 
 {seller}
 
@@ -168,36 +202,47 @@ integer that the source actually establishes -- not the one that would make the
 finding look useful.
 
 Product relevance, 0-3
-  0 = no demonstrated connection to the offer
-  1 = broad connection to finance
-  2 = concerns accounts payable work
-  3 = explicitly concerns invoice-to-PO matching or discrepancy review
+  0 = no demonstrated connection to a listed capability
+  1 = same broad business area only
+  2 = a related workflow is described, but the exact task is unclear
+  3 = the source explicitly describes a task this product handles
 
 Prospect relevance, 0-3
-  0 = no demonstrated connection to the person's work
+  0 = no demonstrated connection to this person's work
   1 = company-wide development
-  2 = directly concerns the person's team or function
-  3 = evidence shows the person owns or publicly discussed this specific initiative
+  2 = concerns their team or function
+  3 = evidence shows the person owns or publicly discussed this initiative
 
 Evidence quality, 0-2
   0 = unsupported or contradicted
-  1 = credible secondary reporting supports the specific claim
-  2 = a direct source supports the claim, such as the company's job posting or
+  1 = credible secondary reporting supports the claim
+  2 = a direct source supports the claim, such as the company's own posting or
       the person's own statement
 
 Timeliness, 0-2
-  0 = stale or undated, with no evidence it still matters
-  1 = dated and plausibly relevant today
-  2 = demonstrably current, such as an open role or ongoing initiative
+  0 = stale or undated with no evidence of current relevance
+  1 = dated and plausibly relevant
+  2 = demonstrably current, such as an active job posting
+
+Product relevance is about THIS product only:
+- Score 2 or 3 only when you can name which capability from the list above
+  connects to which task the source actually describes. Put that capability in
+  the "capability" field, copied exactly from the list, and say in the reason
+  which source-supported task it connects to.
+- A job title alone proves nothing. Someone working in finance, procurement or
+  payables does not thereby need this particular product; a finance title is
+  not evidence of any specific task.
+- A company being large, funded, growing or newsworthy is not a connection to
+  what we sell. That is 0.
+- If no listed capability connects, score 0 or 1 and leave "capability" empty.
+  That is a correct and useful answer.
 
 Score what the source establishes, and nothing more:
 - A recently published article about an old event does NOT automatically earn 2
   for timeliness. Date the event, not the page.
-- A finance job title alone does NOT prove the person owns a particular
-  initiative. That is a 3 for prospect relevance only when the evidence shows
-  them owning or publicly discussing this specific thing.
-- A company being large, funded, growing or newsworthy is NOT a connection to
-  our offer. That is 0 for product relevance.
+- A job title alone does NOT prove the person owns a particular initiative.
+  That is a 3 for prospect relevance only when the evidence shows them owning
+  or publicly discussing this specific thing.
 - You are scoring the strength of an outreach angle. You are NOT predicting
   whether they will buy, and you must not reason about that.
 
@@ -210,8 +255,9 @@ Return JSON only, with one entry per finding_id given above and no others:
       "prospect_relevance": 0,
       "evidence_quality": 0,
       "timeliness": 0,
-      "product_relevance_reason": "at most 15 words on what the source shows",
-      "prospect_relevance_reason": "at most 15 words",
+      "capability": "the capability from the list above that connects, copied exactly, or an empty string",
+      "product_relevance_reason": "at most 20 words naming the capability and the source-supported task it connects to",
+      "prospect_relevance_reason": "at most 15 words on what the source shows",
       "evidence_quality_reason": "at most 15 words",
       "timeliness_reason": "at most 15 words"
     }}
@@ -237,7 +283,7 @@ The one signal this email is built on:
   Published by: {publisher}{date_line}
   Source: {url}
 {quote_line}
-
+{capability_line}
 Why it was chosen: {selection_reason}
 
 Write it so it reads like one person writing to another: plain words, no
@@ -248,11 +294,13 @@ not have been sent to anyone else.
 What you may and may not say:
 - You MAY note the fact and ask how they handle something related to it.
 - You MAY NOT claim or imply they have a backlog, are losing money, are making
-  errors, are inefficient, or want new software. A job posting mentioning invoice
-  matching supports asking how the team handles discrepancies today. It does not
-  establish a problem.
+  errors, are inefficient, or want new software. A source describing a task
+  supports asking how the team handles that task today. It does not establish
+  that anything is going wrong.
 - You MAY NOT invent customers, metrics, savings, mutual contacts, or product
-  features beyond our two stated capabilities.
+  features beyond the capabilities listed above.
+- Write about one capability, the one named above if there is one. Do not list
+  the others.
 {quote_rule}
 
 End the body with exactly one question mark, in the final sentence.
