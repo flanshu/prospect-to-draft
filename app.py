@@ -16,11 +16,15 @@ from html import escape
 import streamlit as st
 
 from outreach import config, fixtures, verify
-from outreach.pipeline import execute
+from outreach.pipeline import SignalNotEligible, execute, redraft
 from outreach.schema import (
+    CONTEXT_ONLY,
+    ELIGIBLE,
+    EXCLUDED,
     PROV_MODEL,
     PROV_SEARCH_SUMMARY,
     PROV_SOURCE_TEXT,
+    SCORE_MAX,
     STAGES,
     STATUS_APPROVED,
     STATUS_AWAITING_REVIEW,
@@ -150,6 +154,28 @@ h1, h2, h3, h4 { letter-spacing: -0.01em; }
 .check .rs { font-size: .79rem; color: var(--ink-soft); line-height: 1.45; margin-top: .25rem; }
 .tally { font-size: .84rem; color: var(--ink-soft); margin: .55rem 0 .15rem; }
 .tally .cap { color: var(--ink-faint); font-size: .78rem; }
+
+/* ---- ranked signals ---- */
+.card-head { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem .6rem; margin-bottom: .5rem; }
+.score { font-size: 1.15rem; font-weight: 700; color: var(--ink); line-height: 1; }
+.score.sm { font-size: 1rem; }
+.score .of { font-size: .78rem; font-weight: 600; color: var(--ink-faint); }
+.rank {
+  font-size: .82rem; font-weight: 700; color: var(--accent);
+  background: #EEF3FF; border: 1px solid #C6D6FB; border-radius: 6px; padding: .1rem .4rem;
+}
+.rank-claim { font-size: .97rem; line-height: 1.5; color: var(--ink); font-weight: 500; }
+.comps { display: flex; flex-wrap: wrap; gap: .35rem; margin: .6rem 0 .15rem; }
+.comp {
+  border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft);
+  padding: .22rem .5rem; font-size: .78rem; color: var(--ink-soft);
+  display: flex; align-items: baseline; gap: .35rem;
+}
+.comp .cv { font-weight: 700; color: var(--ink); }
+.comp .cm { font-weight: 600; color: var(--ink-faint); font-size: .72rem; }
+.comp-why { font-size: .82rem; color: var(--ink-soft); line-height: 1.5; margin: .22rem 0; }
+.comp-why .n { font-weight: 650; color: var(--ink); }
+.draft-from { font-size: .82rem; color: var(--ink-faint); margin: .1rem 0 .5rem; }
 
 /* ---- exception states ---- */
 .exception { border-radius: 12px; padding: 1rem 1.15rem; margin-bottom: .85rem; border: 1px solid; }
@@ -305,50 +331,224 @@ def run_fixture(fixture_id: str) -> Run:
 
 
 # ---------------------------------------------------------------------------
-# LEFT column — the selected signal
+# LEFT column — the ranked signals and the one under review
 # ---------------------------------------------------------------------------
-def render_signal_panel(run: Run) -> None:
-    selected = run.selected_finding()
-    if selected is None:
-        return
+ELIGIBILITY_LABEL = {
+    ELIGIBLE: ("Eligible signal", "good"),
+    CONTEXT_ONLY: ("Context only", "attention"),
+    EXCLUDED: ("Excluded", "stopped"),
+}
 
-    label, tooltip = PROV_LABEL.get(selected.provenance, ("Unknown", ""))
-    source_name = selected.publisher or verify.publisher_from_url(selected.url, "source")
-    meta = [f'<a href="{escape(selected.url)}" target="_blank">{escape(source_name)}</a>']
-    if selected.date:
-        meta.append(escape(selected.date))
-    meta.append(escape(label))
 
-    excerpt = ""
-    if selected.quote_verified and selected.quote:
-        excerpt = (
-            f'<div class="excerpt">“{escape(selected.quote)}”'
-            f'<span class="tag">Verified excerpt — matched word for word on the source page.</span></div>'
+def _shorten(text: str, limit: int = 110) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def source_line(finding) -> str:
+    """Publisher · date · link · text status, as one line."""
+    label, _ = PROV_LABEL.get(finding.provenance, ("Unknown", ""))
+    name = finding.publisher or verify.publisher_from_url(finding.url, "source")
+    bits = [f'<a href="{escape(finding.url)}" target="_blank">{escape(name)}</a>']
+    if finding.date:
+        bits.append(escape(finding.date))
+    bits.append(escape(label))
+    return f'<div class="source-line">{" · ".join(bits)}</div>'
+
+
+def excerpt_block(finding) -> str:
+    if finding.quote_verified and finding.quote:
+        return (
+            f'<div class="excerpt">“{escape(finding.quote)}”'
+            '<span class="tag">Verified excerpt — matched word for word on the '
+            "source page.</span></div>"
         )
-    elif selected.provenance == PROV_SEARCH_SUMMARY:
-        excerpt = (
-            f'<div class="excerpt" style="border-left-color:#C8CEDA">'
-            f'<span class="tag" style="margin-top:0">No verified excerpt — {escape(tooltip)}</span></div>'
-        )
-
-    why = (
-        f'<div class="why"><strong>Why it matters here:</strong> {escape(run.selection_reason)}</div>'
-        if run.selection_reason else ""
+    _, tooltip = PROV_LABEL.get(finding.provenance, ("Unknown", ""))
+    return (
+        '<div class="excerpt" style="border-left-color:#C8CEDA">'
+        f'<span class="tag" style="margin-top:0">No verified excerpt — {escape(tooltip)}'
+        "</span></div>"
     )
+
+
+def render_component_scores(score, *, key: str, open_default: bool = False) -> None:
+    """The four rubric scores. Numbers always visible, reasons collapsed."""
+    chips = "".join(
+        f'<div class="comp"><span class="cl">{escape(label)}</span>'
+        f'<span class="cv">{value}<span class="cm">/{maximum}</span></span></div>'
+        for _, label, value, maximum, _ in score.components()
+    )
+    html(f'<div class="comps">{chips}</div>')
+    if st.toggle("Why these scores", value=open_default, key=f"why_{key}"):
+        rows = "".join(
+            f'<div class="comp-why"><span class="n">{escape(label)} '
+            f"{value} of {maximum}</span> — {escape(reason or 'no reason given')}</div>"
+            for _, label, value, maximum, reason in score.components()
+        )
+        html(f"<div>{rows}</div>")
+
+
+def render_active_signal(run: Run) -> None:
+    """The signal the draft is currently written from, in full."""
+    finding = run.selected_finding()
+    if finding is None:
+        return
+    score = run.score_for(finding.finding_id)
+    rank = next(
+        (r for r, f, _ in run.ranked_findings(ELIGIBLE) if f.finding_id == finding.finding_id),
+        0,
+    )
+
+    heads = ['<div class="card-label" style="margin:0">Selected signal</div>']
+    if score is not None:
+        heads.append(f'<span class="score">{score.total}<span class="of"> / {SCORE_MAX}</span></span>')
+    if rank:
+        heads.append(pill(f"Ranked #{rank}", "mode"))
+    if run.recommended_id == finding.finding_id:
+        heads.append(pill("Recommended by the app", "review"))
+    elif run.recommendation_was_overridden():
+        heads.append(pill("Your choice — not the app's pick", "attention"))
 
     html(
         '<div class="card">'
+        f'<div class="card-head">{"".join(heads)}</div>'
+        f'<div class="signal-claim">{escape(finding.claim)}</div>'
+        f"{source_line(finding)}{excerpt_block(finding)}"
+        + (
+            f'<div class="why"><strong>Why it ranked first:</strong> '
+            f"{escape(run.selection_reason)}</div>"
+            if run.selection_reason and run.recommended_id == finding.finding_id
+            else ""
+        )
+        + "</div>"
+    )
+
+    if score is not None:
+        with st.container(border=True):
+            render_component_scores(score, key=f"active_{run.run_id}", open_default=False)
+            st.caption(
+                f"{score.total} of {SCORE_MAX} scores the strength of this outreach angle. "
+                "It is not a prediction that they will buy, and it never overrides an "
+                "unresolved identity or an unsupported claim."
+            )
+    if run.recommendation_was_overridden():
+        rec = run.finding_by_id(run.recommended_id)
+        rec_score = run.score_for(run.recommended_id)
+        rec_rank = next(
+            (r for r, f, _ in run.ranked_findings(ELIGIBLE)
+             if f.finding_id == run.recommended_id),
+            0,
+        )
+        if rec is not None:
+            st.caption(
+                f"The app recommended #{rec_rank or 1} — “{_shorten(rec.claim, 90)}”"
+                + (f" ({rec_score.total} of {SCORE_MAX})" if rec_score else "")
+                + ". You chose a different signal; both are kept on this run."
+            )
+
+
+def render_ranked_signals(run: Run, *, allow_switch: bool = False) -> None:
+    """Every scored finding in rank order, with the switch control."""
+    entries = run.ranked_findings()
+    if not entries:
+        return
+    eligible_count = sum(1 for _, _, s in entries if s.eligibility == ELIGIBLE)
+    html(
+        '<div class="card-label" style="margin:.9rem 0 .4rem">'
+        f"Ranked signals · {eligible_count} eligible of {len(entries)} scored</div>"
+    )
+
+    for rank, finding, score in entries:
+        label, tone = ELIGIBILITY_LABEL.get(score.eligibility, ("Scored", "mode"))
+        is_active = finding.finding_id == run.active_id
+        is_top = rank == 1
+        with st.container(border=True):
+            head = [
+                f'<span class="rank">{"#" + str(rank) if rank else "—"}</span>',
+                f'<span class="score sm">{score.total}<span class="of"> / {SCORE_MAX}</span></span>',
+                pill(label, tone),
+            ]
+            if finding.finding_id == run.recommended_id:
+                head.append(pill("Recommended", "review"))
+            if is_active:
+                head.append(pill("In review", "good"))
+            html(
+                f'<div class="card-head">{"".join(head)}</div>'
+                f'<div class="rank-claim">{escape(finding.claim)}</div>'
+                f"{source_line(finding)}"
+            )
+            if score.eligibility != ELIGIBLE and score.eligibility_reason:
+                st.caption(score.eligibility_reason)
+            if (
+                finding.finding_id == run.recommended_id
+                and run.selection_reason
+                and not is_active
+            ):
+                html(
+                    '<div class="why"><strong>Why the app ranked this first:</strong> '
+                    f"{escape(run.selection_reason)}</div>"
+                )
+            # The top eligible signal opens with its reasons showing; the rest
+            # stay collapsed until asked for.
+            render_component_scores(
+                score,
+                key=f"{run.run_id}_{finding.finding_id}",
+                open_default=is_top and is_active,
+            )
+            if finding.quote_verified and finding.quote and not is_active:
+                html(excerpt_block(finding))
+            if allow_switch and score.eligibility == ELIGIBLE and not is_active:
+                if st.button(
+                    "Use this signal",
+                    key=f"use_{run.run_id}_{finding.finding_id}",
+                    width="stretch",
+                    help="Rewrites the draft from this finding. No new web research.",
+                ):
+                    request_switch(run, finding.finding_id)
+
+
+def render_legacy_signal(run: Run) -> None:
+    """A run saved before ranked signals existed: show it as it was stored."""
+    finding = run.selected_finding()
+    if finding is None:
+        return
+    html(
+        '<div class="card">'
         '<div class="card-label">Selected signal</div>'
-        f'<div class="signal-claim">{escape(selected.claim)}</div>'
-        f'<div class="source-line">{" · ".join(meta)}</div>'
-        f"{excerpt}{why}"
-        "</div>"
+        f'<div class="signal-claim">{escape(finding.claim)}</div>'
+        f"{source_line(finding)}{excerpt_block(finding)}"
+        + (
+            f'<div class="why"><strong>Why it matters here:</strong> '
+            f"{escape(run.selection_reason)}</div>"
+            if run.selection_reason
+            else ""
+        )
+        + "</div>"
+    )
+    st.caption(
+        "This run was saved before ranked signals were added, so it has no rubric "
+        "scores and no alternatives to switch to. Nothing has been scored "
+        "retrospectively — the evidence and draft are exactly as they were stored."
     )
     render_checks(run)
     render_alternatives(run)
 
 
+def render_signal_panel(run: Run, *, allow_switch: bool = False) -> None:
+    """Left column: the signal under review, then the whole ranked list.
+
+    ``allow_switch`` is false for a finalised run, so an approved or rejected
+    run stays read-only under the same rule as the draft editor.
+    """
+    if not run.has_ranking():
+        render_legacy_signal(run)
+        return
+    render_active_signal(run)
+    render_ranked_signals(run, allow_switch=allow_switch)
+
+
 def render_checks(run: Run) -> None:
+    """Pass/fail view of the active signal's components (legacy runs included)."""
     if not run.checks:
         return
     met, total = run.checks_met()
@@ -373,6 +573,7 @@ def render_checks(run: Run) -> None:
 
 
 def render_alternatives(run: Run) -> None:
+    """Other findings, for runs with no ranking data."""
     others = [(i, f) for i, f in enumerate(run.findings) if i != run.selected_index]
     if not others:
         return
@@ -391,19 +592,174 @@ def render_alternatives(run: Run) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Switching the signal under review
+# ---------------------------------------------------------------------------
+def draft_keys(run: Run) -> tuple[str, str]:
+    """Widget keys for the draft editor, revised whenever the draft is replaced.
+
+    Streamlit keeps a widget's value against its key, so re-rendering the same
+    key after a switch would show the previous signal's email next to the new
+    signal's evidence. Bumping the revision gives the new draft its own widgets.
+    """
+    rev = st.session_state.get(f"draft_rev_{run.run_id}", 0)
+    return f"subj_{run.run_id}_{rev}", f"body_{run.run_id}_{rev}"
+
+
+def _has_unsaved_edits(run: Run) -> bool:
+    """True when the editor holds text the run has not stored."""
+    subj_key, body_key = draft_keys(run)
+    subject = st.session_state.get(subj_key)
+    body = st.session_state.get(body_key)
+    if subject is None and body is None:
+        return False
+    return (
+        (subject is not None and subject != run.draft.final_subject())
+        or (body is not None and body != run.draft.final_body())
+    )
+
+
+def request_switch(run: Run, finding_id: str) -> None:
+    """Ask to switch signals, confirming first if edits would be lost."""
+    if _has_unsaved_edits(run):
+        subj_key, body_key = draft_keys(run)
+        # Hold the unsaved text while we ask, so no path through the dialog can
+        # lose it -- including the one where the switch itself fails.
+        st.session_state["pending_switch"] = finding_id
+        st.session_state["pending_edits"] = (
+            st.session_state.get(subj_key, run.draft.final_subject()),
+            st.session_state.get(body_key, run.draft.final_body()),
+        )
+        st.rerun()
+    do_switch(run, finding_id)
+
+
+def _restore_pending_edits(run: Run) -> None:
+    """Put held text back into the editor."""
+    held = st.session_state.pop("pending_edits", None)
+    if not held:
+        return
+    subj_key, body_key = draft_keys(run)
+    st.session_state[subj_key], st.session_state[body_key] = held
+
+
+def do_switch(run: Run, finding_id: str) -> None:
+    """Rewrite the draft from another finding. No new research, same run."""
+    st.session_state.pop("pending_switch", None)
+    draft_fn = None
+    if run.mode == "fixture":
+        canned = fixtures.alternate_draft(run.fixture_id, finding_id)
+        if canned is None:
+            st.error(
+                "This fixture has no stored draft for that signal, and generating one "
+                "would need a live model call. Fixture A's two eligible signals are the "
+                "ones wired for this."
+            )
+            _restore_pending_edits(run)
+            return
+        draft_fn = lambda _run, _finding: canned  # noqa: E731 - fixture, not the model
+    elif not config.credentials_available():
+        st.error(
+            "Rewriting the draft needs GOOGLE_API_KEY. The saved research and scores are "
+            "untouched, and the current draft has been kept."
+        )
+        _restore_pending_edits(run)
+        return
+
+    try:
+        with st.spinner("Rewriting the draft from the chosen signal…"):
+            redraft(run, finding_id, draft_fn=draft_fn)
+    except SignalNotEligible as exc:
+        st.error(str(exc))
+        _restore_pending_edits(run)
+        return
+    except Exception as exc:
+        st.error(
+            f"Could not rewrite the draft: {type(exc).__name__}: {exc}. The previous "
+            "draft and its original signal were kept — try again, or keep the one you have."
+        )
+        persist(run)
+        _restore_pending_edits(run)
+        return
+
+    # The reviewer chose to replace their edits, so drop the held text.
+    st.session_state.pop("pending_edits", None)
+    # Give the rewritten draft its own editor widgets.
+    st.session_state[f"draft_rev_{run.run_id}"] = (
+        st.session_state.get(f"draft_rev_{run.run_id}", 0) + 1
+    )
+    persist(run)
+    st.toast("Draft rewritten from the chosen signal. It needs a fresh approval.")
+    st.rerun()
+
+
+def render_pending_switch(run: Run) -> None:
+    """Confirm before replacing edits the reviewer has not saved."""
+    finding_id = st.session_state.get("pending_switch")
+    if not finding_id:
+        return
+    finding = run.finding_by_id(finding_id)
+    st.warning(
+        "You have unsaved edits in the draft. Switching to "
+        f"“{_shorten(finding.claim, 80) if finding else finding_id}” replaces them with a "
+        "newly written draft.",
+        icon="✏️",
+    )
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    if c1.button("Replace my edits", key=f"sw_yes_{run.run_id}", type="primary", width="stretch"):
+        do_switch(run, finding_id)
+    if c2.button("Keep my edits", key=f"sw_no_{run.run_id}", width="stretch"):
+        st.session_state.pop("pending_switch", None)
+        _restore_pending_edits(run)
+        st.rerun()
+    if c3.button("Save edits first", key=f"sw_save_{run.run_id}", width="stretch"):
+        subj_key, body_key = draft_keys(run)
+        held = st.session_state.get("pending_edits") or (
+            st.session_state.get(subj_key, run.draft.final_subject()),
+            st.session_state.get(body_key, run.draft.final_body()),
+        )
+        run.draft.edited_subject, run.draft.edited_body = held
+        run.log("Human review", "Salesperson saved edits before switching signal.")
+        persist(run)
+        st.session_state.pop("pending_switch", None)
+        _restore_pending_edits(run)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # RIGHT column — the draft
 # ---------------------------------------------------------------------------
 def render_draft_panel(run: Run, *, allow_review: bool) -> None:
     editable = allow_review and run.status == STATUS_AWAITING_REVIEW
     html('<div class="card-label" style="margin-bottom:.35rem">Draft for review</div>')
 
+    written_from = run.draft.finding_id or run.active_id
+    finding = run.finding_by_id(written_from)
+    if finding is not None:
+        score = run.score_for(written_from)
+        rank = next(
+            (r for r, f, _ in run.ranked_findings(ELIGIBLE) if f.finding_id == written_from),
+            0,
+        )
+        bits = [f"signal {'#' + str(rank) if rank else written_from}"]
+        if score is not None:
+            bits.append(f"{score.total} of {SCORE_MAX}")
+        html(
+            f'<div class="draft-from">Written from {escape(" · ".join(bits))} — '
+            f"{escape(_shorten(finding.claim, 95))}</div>"
+        )
+
+    render_pending_switch(run)
+
+    subj_key, body_key = draft_keys(run)
+    # When held text has been put back into these keys, Streamlit owns the
+    # value and passing a default as well only earns a warning.
+    subj_kwargs = {} if subj_key in st.session_state else {"value": run.draft.final_subject()}
+    body_kwargs = {} if body_key in st.session_state else {"value": run.draft.final_body()}
     subject = st.text_input(
-        "Subject", value=run.draft.final_subject(),
-        key=f"subj_{run.run_id}", disabled=not editable,
+        "Subject", key=subj_key, disabled=not editable, **subj_kwargs,
     )
     body = st.text_area(
-        "Email body", value=run.draft.final_body(), height=330,
-        key=f"body_{run.run_id}", disabled=not editable,
+        "Email body", height=330, key=body_key, disabled=not editable, **body_kwargs,
     )
 
     if editable:
@@ -421,8 +777,8 @@ def render_draft_panel(run: Run, *, allow_review: bool) -> None:
             st.toast("Edits saved.")
             st.rerun()
         st.caption(
-            "Editing, approving or rejecting never re-runs research and never creates "
-            "another run. No email is sent — the workflow ends here."
+            "Editing, approving, rejecting or switching signal never re-runs research "
+            "and never creates another run. No email is sent — the workflow ends here."
         )
     elif run.draft.decision:
         tone = "good" if run.draft.decision == "approved" else "stopped"
@@ -541,6 +897,15 @@ def render_insufficient(run: Run) -> None:
         "contact. Everything it checked is below.</p>"
         "</div>"
     )
+    if run.has_ranking():
+        st.caption(
+            "Every finding below was verified and scored against the same 10-point "
+            "rubric. None of them is eligible to write from, and the app will not "
+            "invent a connection to make one eligible."
+        )
+        render_ranked_signals(run)
+        return
+
     left, right = st.columns([1, 1])
     with left:
         if run.selected_finding() is not None:
@@ -609,8 +974,9 @@ def render_run(run: Run, *, allow_review: bool = True, show_gate: bool = True) -
         render_incomplete(run)
     elif run.draft.subject or run.draft.body:
         left, right = st.columns([1, 1], gap="large")
+        allow_switch = allow_review and run.status == STATUS_AWAITING_REVIEW
         with left:
-            render_signal_panel(run)
+            render_signal_panel(run, allow_switch=allow_switch)
         with right:
             render_draft_panel(run, allow_review=allow_review)
 

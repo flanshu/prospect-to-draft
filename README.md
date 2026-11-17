@@ -74,9 +74,9 @@ python -m pytest tests -q
 | --- | --- | --- |
 | 1 · Identity | One grounded search for this person at this company; a judging call decides `confirmed` / `ambiguous` / `not_found`. | `outreach/pipeline.py: stage_identity` |
 | 2 · Research | Grounded search over company pages, job postings, announcements, interviews. Up to three findings extracted, each tied to a cited URL, then **verified**. | `stage_research` |
-| 3 · Signal | The verified findings are compared against the seller profile. One is selected, with a one-sentence reason and four reviewable checks. | `stage_signal` |
-| 4 · Draft | A subject and short body built from the selected evidence only. | `stage_draft` |
-| 5 · Human review | Edit, approve or reject in the UI. The workflow ends here. | `app.py` |
+| 3 · Signal | Every verified finding is scored individually against a fixed 10-point rubric in **one** model call, then ranked, tie-broken and gated in Python. | `stage_score`, `rank_scores` |
+| 4 · Draft | A subject and short body built from the top-ranked eligible signal only. | `stage_draft` |
+| 5 · Human review | Edit, approve, reject — or switch to another eligible signal, which rewrites the draft from that evidence without repeating any research. | `app.py`, `pipeline.redraft` |
 
 ### Run statuses — these are different outcomes, not one failure bucket
 
@@ -86,6 +86,63 @@ python -m pytest tests -q
 | `Insufficient evidence` | Research worked, but nothing credible connects this prospect to our offer. The app refuses to invent a reason to write, and records why. |
 | `Research incomplete` | The search provider failed or is not configured. We do **not** know what the evidence says. Offers retry. |
 | `Awaiting review` → `Approved` / `Rejected` | A draft exists and a human has it. |
+
+### Ranked signals — the 10-point rubric
+
+Each candidate finding is scored on its own. The model returns four integers and
+a short reason for each, keyed by the finding's stable `finding_id`; Python
+validates, totals, sorts and decides eligibility.
+
+| Component | Range | 0 means | top of range means |
+| --- | --- | --- | --- |
+| Product relevance | 0–3 | no demonstrated connection to the offer | explicitly concerns invoice-to-PO matching or discrepancy review |
+| Prospect relevance | 0–3 | no demonstrated connection to the person's work | the person owns or publicly discussed this specific initiative |
+| Evidence quality | 0–2 | unsupported or contradicted | a direct source — the company's own posting, or the person's own words |
+| Timeliness | 0–2 | stale or undated | demonstrably current, such as an open role |
+
+**The total scores the strength of an outreach angle. It is not a probability of
+a sale**, and it is shown with that caveat everywhere it appears.
+
+What Python decides, not the model:
+
+- **Validation.** A missing, duplicate or unknown `finding_id`, a missing
+  component, a non-integer or an out-of-range value is rejected outright. There
+  is no "repair the output" path and no silent fallback to the first finding.
+  Invalid output is retried **once**; a second failure saves `Research
+  incomplete` with a retry action, because an unscored run is a provider
+  problem, not a verdict on the prospect.
+- **Eligibility, applied before any winner is chosen:**
+
+  | Condition | Outcome |
+  | --- | --- |
+  | Failed source verification | **Excluded** from ranking and drafting. A model score can never promote it. |
+  | Evidence quality 0 | **Excluded** — unsupported or contradicted. |
+  | Product relevance 0, or prospect relevance 0 | **Context only** — shown with its score, cannot generate a draft. |
+  | Same event as a higher-scoring finding | **Excluded** as a duplicate, so one announcement cannot occupy two ranks. |
+  | No eligible signal at all | `Insufficient evidence`, listing the context-only findings and their scores. |
+
+- **Order.** Eligible signals by total descending; ties broken on product
+  relevance, then prospect relevance, then evidence quality, then timeliness,
+  then the original research order. Context-only and excluded findings sit below
+  every eligible one **however high their raw total** — fixture C's best finding
+  scores 7 of 10 and still produces no draft.
+
+### Switching signal
+
+The first draft uses the top-ranked eligible signal. **Use this signal** on any
+other eligible finding rewrites the draft from that finding's evidence:
+
+- the saved research and scores are reused — **no new web search, no re-scoring**,
+  no second run;
+- unsaved edits are confirmed first (replace them, keep them, or save them and
+  then switch), and the held text is restored on every path that does not switch;
+- the run returns to `Awaiting review` and needs a fresh approval;
+- if regeneration fails, the previous draft **and** the signal it was written
+  from are both restored, so the evidence on screen always matches the email;
+- the app's own recommendation stays visible and labelled, so a reviewer can see
+  that #1 was recommended while reviewing #2;
+- an approved or rejected run is read-only — no switching, the same rule as the
+  draft editor.
 
 ### How claims are kept honest
 
@@ -105,9 +162,11 @@ Additional guards:
 - A quote that cannot be matched on the page is deleted, not shown unverified.
 - After drafting, any remaining quotation marks in the body are stripped unless
   the quoted span is inside the verified quote (`_strip_unverified_quotes`).
-- A failed **Evidence** check, or an unresolved identity, stops the run before
-  drafting. "3 of 4 checks met" is a review aid, never a buying probability, and
-  never overrides those gates.
+- An unresolved identity stops the run before any research spend, and a finding
+  scored 0 for evidence quality is excluded from ranking and from drafting. A
+  score is a review aid, never a buying probability: 8 of 10 with unsupported
+  evidence produces no draft, and 7 of 10 with no product connection is context
+  only.
 - The draft may note a fact and ask a question about it. It may not assert that
   the company has a backlog, loses money, or wants software — that rule is in
   the drafting prompt (`outreach/prompts.py`).
@@ -123,9 +182,9 @@ run is never evidence that live integration works.**
 
 | Fixture | Scenario | Expected status |
 | --- | --- | --- |
-| A | Happy path — Priya Raghavan, Northwind Logistics | `Awaiting review`, 4 of 4 checks |
+| A | Happy path — Priya Raghavan, Northwind Logistics. Three scored findings: the AP posting at **9/10**, her own interview at **7/10**, a funding round at **5/10, context only**. Switching to the runner-up uses a stored draft, so it works with no API key. | `Awaiting review` |
 | B | Ambiguous identity — Michael Chen, Veridian Health | `Needs clarification` |
-| C | Weak signal — Daniel Okafor, Lumenbridge Studios | `Insufficient evidence`, 3 of 4 checks |
+| C | Weak signal — Daniel Okafor, Lumenbridge Studios. The best finding scores **7/10** and is still context only. | `Insufficient evidence` |
 | D | Provider failure — Alina Moreau, Castellan Foods | `Research incomplete` |
 
 The submitted app also accepts a new prospect and runs the real research path.
@@ -145,8 +204,15 @@ runs(run_id PK, created_at, updated_at, prospect_name, company, status, mode, pa
 - **unset** → SQLite at `outreach_runs.db`.
 
 Saves are upserts keyed on `run_id`, so editing or approving a draft updates the
-same row. Approving, saving edits or rejecting **never** triggers another search
-and never creates a second run.
+same row. Approving, saving edits, rejecting or switching signal **never**
+triggers another search and never creates a second run.
+
+The payload carries the component scores and their reasons, the ranking, the
+recommended `finding_id`, the reviewer's active `finding_id` and the draft's own
+`finding_id`. Reopening a run from history therefore restores exactly what the
+reviewer saw, with **no model call**. A run saved before ranking existed still
+opens with its original evidence and draft, labelled "no score recorded" — no
+scores are invented for it.
 
 ### Supabase setup
 
@@ -199,10 +265,13 @@ and every status carries a **text label**, never colour alone. The theme lives i
    five-stage indicator that updates as identity, research, selection and
    drafting actually execute.
 2. *Where did we find it, and why does it matter?* — the left column leads with
-   the finding as a readable sentence, then publisher · date · clickable source ·
-   text status, then the verified excerpt if there is one, then one sentence on
-   why it matters to this prospect, then the four checks. Alternative findings
-   sit in an expander below.
+   the signal under review: its score out of 10, its rank, and whether it is the
+   app's recommendation or your own choice, then the claim, then publisher ·
+   date · clickable source · text status, the verified excerpt if there is one,
+   and one sentence on why it ranked first. Below it, **Ranked signals** lists
+   every scored finding in order with its rank, total, eligibility label, source
+   and component scores — reasons collapsed, open by default on the top signal —
+   and a **Use this signal** button on each eligible alternative.
 3. *Does the email use it accurately?* — the right column holds the editable
    subject and body with **Approve draft** / **Reject draft** directly beneath,
    and the evidence stays on screen while you edit. After a decision the editor
@@ -212,13 +281,14 @@ Exception states replace the two columns with an actionable panel:
 
 - **Needs clarification** — the possible matches, each with its source link, then
   a field for a profile URL or a correction, and a primary *Confirm and continue*.
-- **Insufficient evidence** — what was checked, the closest finding, and the
-  checks grid with the failed check highlighted, so it is clear why no draft was
-  produced.
+- **Insufficient evidence** — the ranked list of everything that was checked,
+  each with its score and the reason it is context only or excluded, so it is
+  clear why no draft was produced.
 - **Research incomplete** — the provider error and a *Retry this run* button.
 
-**Run history** is one row per run: prospect (and role), company, the selected
-signal as a full sentence, status, date and live/fixture mode. Selecting a row
+**Run history** is one row per run: prospect (and role), company, the active
+signal as a full sentence with its score (and "reviewer's choice" when it is not
+the app's pick), status, date and live/fixture mode. Selecting a row
 reopens the saved result in place, review controls included.
 
 On screens under 900px the columns stack, signal above draft.
@@ -231,12 +301,12 @@ outreach/
   config.py                  Seller profile, models, secrets/env loading
   gemini_client.py           Grounded search + source collection + JSON calls
   prompts.py                 Every prompt, in one readable place
-  pipeline.py                The four stages and the orchestrator
+  pipeline.py                The four stages, scoring/ranking, and redraft
   verify.py                  Page fetch, quote matching, provenance decisions
-  schema.py                  Run / Finding / Source / Check / Draft + statuses
+  schema.py                  Run / Finding / Score / Source / Check / Draft + statuses
   store.py                   SQLite and Postgres persistence
   fixtures.py                Four rehearsal scenarios
-tests/test_offline.py        19 offline checks (no network, no API key)
+tests/test_offline.py        39 offline checks (no network, no API key)
 .streamlit/config.toml       Light theme and accent colour
 ```
 

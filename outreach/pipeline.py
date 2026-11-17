@@ -23,7 +23,12 @@ from .gemini_client import (
     json_call,
 )
 from .schema import (
+    CONTEXT_ONLY,
+    ELIGIBLE,
+    EXCLUDED,
     PROV_SOURCE_TEXT,
+    SCORE_COMPONENTS,
+    SCORE_MAX,
     STATUS_AWAITING_REVIEW,
     STATUS_INSUFFICIENT_EVIDENCE,
     STATUS_NEEDS_CLARIFICATION,
@@ -34,6 +39,7 @@ from .schema import (
     Finding,
     Identity,
     Run,
+    Score,
     Source,
 )
 
@@ -218,6 +224,11 @@ def stage_research(run: Run) -> None:
         run.log("Research", "No attributable findings. Stopping with 'Insufficient evidence'.")
         return
 
+    # Stable ids before anything refers to a finding -- scoring, the UI and the
+    # stored run all key off these rather than a list position.
+    run.findings = findings
+    _assign_finding_ids(run)
+
     # Verify each finding against its source page before it can be used.
     run.log("Research", f"Verifying {len(findings)} finding(s) against their sources.")
     segments = _grounding_segments(run)
@@ -244,91 +255,385 @@ def stage_research(run: Run) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3 -- select one signal
+# Stage 3 -- score every candidate, then rank in Python
 # ---------------------------------------------------------------------------
-def _format_findings_for_prompt(run: Run, usable: list[tuple[int, Finding]]) -> str:
+class ScoringFormatError(RuntimeError):
+    """The scoring call came back in a shape we refuse to guess at."""
+
+
+def _assign_finding_ids(run: Run) -> None:
+    """Give every finding a stable id before anything refers to it."""
+    used: set[str] = set()
+    for i, finding in enumerate(run.findings, start=1):
+        if not finding.finding_id or finding.finding_id in used:
+            finding.finding_id = f"f-{i}"
+        used.add(finding.finding_id)
+
+
+def _format_candidates_for_prompt(candidates: list[Finding]) -> str:
     blocks = []
-    for idx, f in usable:
-        quote = f'\n  verified quote: "{f.quote}"' if f.quote_verified and f.quote else ""
+    for f in candidates:
+        quote = (
+            f'\n  verified quote from the source: "{f.quote}"'
+            if f.quote_verified and f.quote
+            else ""
+        )
         blocks.append(
-            f"[{idx}] claim: {f.claim}\n"
+            f"finding_id: {f.finding_id}\n"
+            f"  claim: {f.claim}\n"
             f"  publisher: {f.publisher or 'unknown'}\n"
             f"  kind: {f.kind or 'unknown'}\n"
-            f"  date: {f.date or 'not stated by the source'}\n"
-            f"  url: {f.url}{quote}"
+            f"  date the source gives: {f.date or 'none stated'}\n"
+            f"  url: {f.url}\n"
+            f"  how it was verified: {f.verification_note}{quote}"
         )
     return "\n\n".join(blocks)
 
 
-def stage_signal(run: Run) -> None:
-    usable = [(i, f) for i, f in enumerate(run.findings) if verify.is_usable(f)]
-    run.log("Signal selection", f"Comparing {len(usable)} verified finding(s) against our offer.")
+def _parse_scores(payload: object, expected_ids: list[str]) -> list[Score]:
+    """Validate the model's scoring output. Raises ``ScoringFormatError``.
 
-    verdict = json_call(
-        prompts.SIGNAL_SELECT.format(
-            seller=prompts.SELLER_BLOCK,
-            name=run.prospect_name,
-            role_line=_role_line(run),
-            company=run.company,
-            findings=_format_findings_for_prompt(run, usable),
+    Rejects a missing, duplicate or unknown finding_id, a missing component, a
+    non-integer and anything outside the rubric's range. There is deliberately
+    no "near enough" path: invalid output is retried once, and then the run
+    stops as "Research incomplete" rather than being quietly repaired.
+    """
+    if not isinstance(payload, dict):
+        raise ScoringFormatError("the scoring call did not return a JSON object")
+    rows = payload.get("scores")
+    if not isinstance(rows, list) or not rows:
+        raise ScoringFormatError('the scoring call returned no "scores" list')
+
+    expected = list(expected_ids)
+    seen: dict[str, Score] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ScoringFormatError("a score entry was not a JSON object")
+        fid = str(row.get("finding_id", "")).strip()
+        if not fid:
+            raise ScoringFormatError("a score entry had no finding_id")
+        if fid not in expected:
+            raise ScoringFormatError(f"unknown finding_id {fid!r} in the scoring output")
+        if fid in seen:
+            raise ScoringFormatError(f"finding_id {fid!r} was scored twice")
+
+        values: dict[str, int] = {}
+        reasons: dict[str, str] = {}
+        for key, label, maximum in SCORE_COMPONENTS:
+            if key not in row:
+                raise ScoringFormatError(f"{fid}: missing {label.lower()} score")
+            raw = row[key]
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                # A float is accepted only when it is exactly an integer.
+                if isinstance(raw, float) and float(raw).is_integer():
+                    raw = int(raw)
+                else:
+                    raise ScoringFormatError(f"{fid}: {label.lower()} was not an integer")
+            if not 0 <= raw <= maximum:
+                raise ScoringFormatError(
+                    f"{fid}: {label.lower()} was {raw}, outside 0-{maximum}"
+                )
+            values[key] = int(raw)
+            reasons[key] = str(row.get(f"{key}_reason", "")).strip()
+
+        seen[fid] = Score(finding_id=fid, reasons=reasons, **values)
+
+    missing = [fid for fid in expected if fid not in seen]
+    if missing:
+        raise ScoringFormatError("no score for " + ", ".join(missing))
+    return [seen[fid] for fid in expected]
+
+
+def _duplicate_of(finding: Finding, kept: list[Finding]) -> Finding | None:
+    """A finding reporting the same event as one already kept.
+
+    Two sources covering one announcement should not occupy two ranks, so the
+    weaker one is set aside rather than shown twice.
+    """
+    for other in kept:
+        if (
+            verify.claim_overlap(finding.claim, other.claim) >= 0.8
+            and verify.claim_overlap(other.claim, finding.claim) >= 0.8
+        ):
+            return other
+    return None
+
+
+def _apply_eligibility(run: Run, scores: list[Score]) -> None:
+    """Decide what each scored finding may be used for.
+
+    Verification comes first: a model score can never promote a finding whose
+    source did not support the claim.
+    """
+    for score in scores:
+        finding = run.finding_by_id(score.finding_id)
+        if finding is None:
+            continue
+        if not verify.is_usable(finding):
+            score.eligibility = EXCLUDED
+            score.eligibility_reason = (
+                "No source supports this claim, so it cannot be ranked or drafted "
+                f"from. {finding.verification_note}"
+            )
+            continue
+        if score.evidence_quality == 0:
+            score.eligibility = EXCLUDED
+            score.eligibility_reason = (
+                "Scored 0 for evidence quality - unsupported or contradicted by the "
+                "source, so it is excluded from ranking and drafting."
+            )
+            continue
+        if score.product_relevance == 0:
+            score.eligibility = CONTEXT_ONLY
+            score.eligibility_reason = (
+                "No demonstrated connection to invoice-to-PO matching or discrepancy "
+                "review, so it is context only and cannot generate a draft."
+            )
+            continue
+        if score.prospect_relevance == 0:
+            score.eligibility = CONTEXT_ONLY
+            score.eligibility_reason = (
+                "Nothing shows this concerns the prospect's own work, so it is context "
+                "only and cannot generate a draft."
+            )
+            continue
+        score.eligibility = ELIGIBLE
+        score.eligibility_reason = ""
+
+
+def rank_scores(run: Run, scores: list[Score]) -> list[str]:
+    """Order the findings for display and store that order on the run.
+
+    Eligible signals by total descending, tie-broken on product relevance, then
+    prospect relevance, then evidence quality, then timeliness, then the
+    original research order. Context-only and excluded findings always sit
+    below the eligible ones, however high their raw total.
+    """
+    order = {f.finding_id: i for i, f in enumerate(run.findings)}
+
+    def key(score: Score) -> tuple:
+        # Negated so a higher score sorts first, while the original research
+        # order still breaks a complete tie ascending.
+        return tuple(-v for v in score.sort_key()) + (order.get(score.finding_id, 0),)
+
+    eligible = sorted((s for s in scores if s.eligibility == ELIGIBLE), key=key)
+    context = sorted((s for s in scores if s.eligibility == CONTEXT_ONLY), key=key)
+    excluded = sorted((s for s in scores if s.eligibility == EXCLUDED), key=key)
+
+    ordered = eligible + context + excluded
+    run.scores = ordered
+    run.ranking = [s.finding_id for s in ordered]
+    return run.ranking
+
+
+def _checks_from_score(run: Run, score: Score) -> list[Check]:
+    """The rubric components as checks a reviewer can argue with."""
+    return [
+        Check(
+            name=label,
+            passed=value > 0,
+            reason=f"{value} of {maximum} - {reason or 'no reason given'}",
         )
-    )
-    if not isinstance(verdict, dict):
-        raise ResearchProviderError("Signal selection returned an unexpected shape.")
-
-    run.checks = [
-        Check.from_dict(c)
-        for c in (verdict.get("checks") or [])
-        if isinstance(c, dict) and "name" in c and "passed" in c
+        for _, label, value, maximum, reason in score.components()
     ]
-    run.selection_reason = str(verdict.get("selection_reason", ""))
 
-    idx = verdict.get("selected_index", -1)
-    valid_indices = {i for i, _ in usable}
-    if not isinstance(idx, int) or idx not in valid_indices:
-        idx = next(iter(sorted(valid_indices)), -1)
-    run.selected_index = idx
 
-    met, total = run.checks_met()
+def _shorten(text: str, limit: int = 90) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
-    # A check tally never overrides evidence. These two gates come first.
-    evidence_check = next((c for c in run.checks if c.name.lower().startswith("evidence")), None)
-    if evidence_check and not evidence_check.passed:
-        run.status = STATUS_INSUFFICIENT_EVIDENCE
-        run.stop_reason = (
-            "The evidence check failed, so the selected claim is not supported by "
-            f"an identifiable source: {evidence_check.reason}"
+
+def winner_rationale(run: Run) -> str:
+    """One plain sentence on why the top signal ranked first."""
+    eligible = [(f, s) for _, f, s in run.ranked_findings(ELIGIBLE)]
+    if not eligible:
+        return ""
+    _, top = eligible[0]
+    if len(eligible) == 1:
+        bits = [
+            f"{label.lower()} {value} of {maximum}" + (f" ({reason})" if reason else "")
+            for _, label, value, maximum, reason in top.components()
+            if value > 0
+        ]
+        return (
+            "It is the only finding that qualifies as a reason to write: "
+            + ", ".join(bits)
+            + f" — {top.total} of {SCORE_MAX} overall."
         )
-        run.log("Signal selection", "Evidence check failed. Stopping before drafting.")
-        return
 
-    if not verdict.get("sufficient", True):
-        run.status = STATUS_INSUFFICIENT_EVIDENCE
-        run.stop_reason = str(verdict.get("insufficient_reason", "")) or (
-            "Nothing in the available evidence connects this prospect to invoice-to-PO "
-            "matching or discrepancy review, so personalised outreach would have to "
-            "invent a reason to write."
-        )
-        run.log(
-            "Signal selection",
-            f"No credible connection to our offer ({met} of {total} checks met). Stopping.",
-        )
-        return
+    runner_finding, runner = eligible[1]
+    gaps = sorted(
+        (
+            (value - int(getattr(runner, key)), label, value, int(getattr(runner, key)), reason)
+            for key, label, value, _, reason in top.components()
+        ),
+        key=lambda g: g[0],
+        reverse=True,
+    )
+    best = gaps[0]
+    runner_claim = _shorten(runner_finding.claim, 70)
 
-    selected = run.selected_finding()
+    if top.total == runner.total:
+        return (
+            f"It ties the runner-up on {top.total} of {SCORE_MAX} and wins on the first "
+            f"tie-break: {best[1].lower()} {best[2]} against {best[3]} "
+            f"(“{runner_claim}”)."
+        )
+    if best[0] <= 0:
+        return (
+            f"It scores {top.total} of {SCORE_MAX} against {runner.total} for the "
+            f"runner-up (“{runner_claim}”)."
+        )
+    detail = f" — {best[4]}" if best[4] else ""
+    return (
+        f"It scores {top.total} of {SCORE_MAX} against {runner.total} for the runner-up "
+        f"(“{runner_claim}”), mainly on {best[1].lower()}: {best[2]} against "
+        f"{best[3]}{detail}."
+    )
+
+
+def stage_score(run: Run) -> None:
+    """Score every candidate, then rank them. One model call, retried once."""
+    _assign_finding_ids(run)
+    candidates = [f for f in run.findings if verify.is_usable(f)]
     run.log(
         "Signal selection",
-        f"Selected: {selected.claim if selected else '(none)'} ({met} of {total} checks met).",
+        f"Scoring {len(candidates)} verified finding(s) against the 10-point rubric.",
+    )
+
+    prompt = prompts.SIGNAL_SCORE.format(
+        seller=prompts.SELLER_BLOCK,
+        name=run.prospect_name,
+        role_line=_role_line(run),
+        company=run.company,
+        findings=_format_candidates_for_prompt(candidates),
+    )
+    expected_ids = [f.finding_id for f in candidates]
+
+    scores: list[Score] = []
+    first_error = ""
+    for attempt in (1, 2):
+        try:
+            scores = _parse_scores(json_call(prompt), expected_ids)
+            break
+        except ScoringFormatError as exc:
+            first_error = first_error or str(exc)
+            if attempt == 1:
+                run.log(
+                    "Signal selection",
+                    f"Scoring output was invalid ({exc}). Retrying once.",
+                )
+                continue
+            raise ResearchProviderError(
+                "The scoring step returned unusable output twice "
+                f"({first_error}; then {exc}). Nothing was scored and no signal was "
+                "chosen - this is a provider problem, not a finding about the prospect."
+            ) from exc
+
+    # Findings that failed verification were never sent for scoring. Record them
+    # at zero so the reviewer can still see they were considered and why not.
+    for finding in run.findings:
+        if finding.finding_id not in expected_ids:
+            scores.append(
+                Score(
+                    finding_id=finding.finding_id,
+                    reasons={
+                        key: "not scored - the claim is not supported by its source"
+                        for key, _, _ in SCORE_COMPONENTS
+                    },
+                )
+            )
+
+    _apply_eligibility(run, scores)
+
+    # Set aside a second report of an event that is already ranked.
+    kept: list[Finding] = []
+    for score in sorted(
+        (s for s in scores if s.eligibility == ELIGIBLE),
+        key=lambda s: tuple(-v for v in s.sort_key()),
+    ):
+        finding = run.finding_by_id(score.finding_id)
+        if finding is None:
+            continue
+        duplicate_of = _duplicate_of(finding, kept)
+        if duplicate_of is not None:
+            score.eligibility = EXCLUDED
+            score.eligibility_reason = (
+                "Reports the same event as a higher-scoring finding "
+                f"({duplicate_of.finding_id}), so it is not ranked separately."
+            )
+            run.log(
+                "Signal selection",
+                f"{score.finding_id} reports the same event as {duplicate_of.finding_id}; "
+                "kept the better-scored one.",
+            )
+            continue
+        kept.append(finding)
+
+    rank_scores(run, scores)
+    eligible = run.ranked_findings(ELIGIBLE)
+    context_only = run.ranked_findings(CONTEXT_ONLY)
+
+    if not eligible:
+        run.selected_index = -1
+        run.active_id = ""
+        run.recommended_id = ""
+        run.checks = []
+        run.status = STATUS_INSUFFICIENT_EVIDENCE
+        details = []
+        if context_only:
+            details.append(
+                f"{len(context_only)} finding(s) are real but context only: "
+                + "; ".join(
+                    f"“{_shorten(f.claim, 70)}” ({s.total} of {SCORE_MAX}, "
+                    + s.eligibility_reason.rstrip(".").lower()
+                    + ")"
+                    for _, f, s in context_only
+                )
+            )
+        excluded = run.ranked_findings(EXCLUDED)
+        if excluded:
+            details.append(f"{len(excluded)} finding(s) were excluded before ranking")
+        run.stop_reason = (
+            "Research completed and the findings were scored, but no finding is both "
+            "connected to invoice-to-PO matching or discrepancy review and connected "
+            "to this person's own work, so there is no honest reason to write. "
+            + (". ".join(details) + "." if details else "")
+        ).strip()
+        run.log(
+            "Signal selection",
+            "No eligible signal after scoring. Stopping with 'Insufficient evidence'.",
+        )
+        return
+
+    _, top_finding, top_score = eligible[0]
+    run.recommended_id = top_finding.finding_id
+    run.set_active_finding(top_finding.finding_id)
+    run.checks = _checks_from_score(run, top_score)
+    run.selection_reason = winner_rationale(run)
+    run.log(
+        "Signal selection",
+        f"Ranked {len(eligible)} eligible signal(s); recommending {top_finding.finding_id} "
+        f"at {top_score.total} of {SCORE_MAX}."
+        + (f" {len(context_only)} context-only finding(s) below." if context_only else ""),
     )
 
 
 # ---------------------------------------------------------------------------
 # Stage 4 -- draft
 # ---------------------------------------------------------------------------
-def stage_draft(run: Run) -> None:
+def stage_draft(run: Run, *, chosen_by_reviewer: bool = False) -> None:
+    """Write the email from whichever finding is active on the run."""
     finding = run.selected_finding()
     if finding is None:
         raise ResearchProviderError("No signal was selected, so there is nothing to draft.")
+
+    score = run.score_for(finding.finding_id)
+    if score is not None and score.eligibility != ELIGIBLE:
+        raise ResearchProviderError(
+            f"{finding.finding_id} is {score.eligibility.replace('_', ' ')} and cannot "
+            "generate a draft: " + score.eligibility_reason
+        )
 
     run.log("Draft", "Writing a first-contact email from the selected evidence.")
     quotable = finding.quote_verified and finding.provenance == PROV_SOURCE_TEXT and finding.quote
@@ -344,7 +649,11 @@ def stage_draft(run: Run) -> None:
             date_line=f"\n  Dated: {finding.date}" if finding.date else "",
             url=finding.url,
             quote_line=f'  Verified quote: "{finding.quote}"' if quotable else "",
-            selection_reason=run.selection_reason or "it is the only verified finding.",
+            selection_reason=(
+                "the salesperson reviewing this run chose this signal themselves."
+                if chosen_by_reviewer
+                else run.selection_reason or "it is the only verified finding."
+            ),
             quote_rule=prompts.QUOTE_RULE_ALLOWED if quotable else prompts.QUOTE_RULE_FORBIDDEN,
         ),
         temperature=0.45,
@@ -367,7 +676,7 @@ def stage_draft(run: Run) -> None:
             "referenced as paraphrase instead.",
         )
 
-    run.draft = Draft(subject=subject, body=body)
+    run.draft = Draft(subject=subject, body=body, finding_id=finding.finding_id)
     run.status = STATUS_AWAITING_REVIEW
     run.log("Human review", "Draft ready for the salesperson to edit, approve or reject.")
 
@@ -391,6 +700,91 @@ def _strip_unverified_quotes(body: str, allowed_quote: str) -> tuple[str, int]:
         return inner
 
     return pattern.sub(repl, body), removed
+
+
+# ---------------------------------------------------------------------------
+# Switching signals after review has started
+# ---------------------------------------------------------------------------
+class SignalNotEligible(RuntimeError):
+    """The reviewer asked for a signal that cannot produce a draft."""
+
+
+def redraft(run: Run, finding_id: str, *, draft_fn=None) -> Run:
+    """Rewrite the draft from a different finding on the SAME run.
+
+    Reuses the research and the scores already on the run: no search, no
+    scoring call, no new run. On failure the previous draft and the signal it
+    was written from are both restored, so a reviewer never ends up looking at
+    one signal's evidence beside another signal's email.
+
+    ``draft_fn`` exists so a fixture run can supply a canned draft instead of
+    calling the model; live runs leave it as None.
+    """
+    score = run.score_for(finding_id)
+    finding = run.finding_by_id(finding_id)
+    if finding is None:
+        raise SignalNotEligible(f"{finding_id} is not a finding on this run.")
+    if score is None:
+        raise SignalNotEligible(f"{finding_id} was never scored, so it cannot be used.")
+    if score.eligibility != ELIGIBLE:
+        raise SignalNotEligible(
+            f"{finding_id} is {score.eligibility.replace('_', ' ')} and cannot generate "
+            "a draft: " + score.eligibility_reason
+        )
+
+    # Snapshot exactly what we would have to put back.
+    before = {
+        "draft": run.draft.to_dict(),
+        "active_id": run.active_id,
+        "selected_index": run.selected_index,
+        "checks": [c.to_dict() for c in run.checks],
+        "status": run.status,
+        "stage": run.stage,
+    }
+
+    run.set_active_finding(finding_id)
+    run.checks = _checks_from_score(run, score)
+    run.log(
+        "Draft",
+        f"Salesperson switched to {finding_id} ({score.total} of {SCORE_MAX}). "
+        "Reusing the saved research and scores — no new search.",
+    )
+    try:
+        if draft_fn is not None:
+            draft = draft_fn(run, finding)
+            if draft is None:
+                raise ResearchProviderError(
+                    "No draft is available for this signal in fixture mode."
+                )
+            draft.finding_id = finding_id
+            run.draft = draft
+            run.status = STATUS_AWAITING_REVIEW
+            run.log(
+                "Human review",
+                "Draft rewritten from the chosen signal; it needs a fresh approval.",
+            )
+        else:
+            stage_draft(run, chosen_by_reviewer=True)
+    except Exception as exc:
+        run.draft = Draft.from_dict(before["draft"])
+        run.active_id = before["active_id"]
+        run.selected_index = before["selected_index"]
+        run.checks = [Check.from_dict(c) for c in before["checks"]]
+        run.status = before["status"]
+        run.stage = before["stage"]
+        run.error = f"{type(exc).__name__}: {exc}"
+        run.log(
+            "Human review",
+            "Could not rewrite the draft from the chosen signal, so the previous draft "
+            f"and its original signal were kept. {run.error}",
+        )
+        raise
+
+    # A regenerated draft has not been reviewed yet.
+    run.draft.decision = ""
+    run.draft.decided_at = ""
+    run.error = ""
+    return run
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +817,7 @@ def execute(run: Run, on_stage: OnStage | None = None, *, skip_identity: bool = 
         if run.status == STATUS_INSUFFICIENT_EVIDENCE:
             return run
 
-        stage_signal(run)
+        stage_score(run)
         cb(run)
         if run.status == STATUS_INSUFFICIENT_EVIDENCE:
             return run

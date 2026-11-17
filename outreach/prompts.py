@@ -147,50 +147,79 @@ Rules:
 """.strip()
 
 # ---------------------------------------------------------------------------
-# Stage 3 -- signal selection
+# Stage 3 -- score every candidate signal against a fixed rubric
+#
+# One structured call scores all candidates at once, keyed by finding_id.
+# Python validates the ids and ranges, totals the scores and sorts; the model
+# never decides the winner and never sees a running total.
 # ---------------------------------------------------------------------------
-SIGNAL_SELECT = """
-Pick the single strongest signal for first-contact outreach, and score it.
+SIGNAL_SCORE = """
+Score each candidate finding below as a reason to contact this prospect now.
 
 {seller}
 
 Prospect: {name}{role_line} at {company}
 
-Verified findings (each is backed by the source shown; index is 0-based):
+Candidate findings (each is already verified against the source shown):
 {findings}
 
-Definitions you must respect:
-- A SIGNAL is a verified fact about the prospect or their team.
-- A HOOK is the connection between that fact, this person's responsibilities, and
-  our offer. A hook is an opening for a question, never a claim about their needs.
+Score every finding separately, using this exact 10-point rubric. Give the
+integer that the source actually establishes -- not the one that would make the
+finding look useful.
 
-Choose the finding that gives the best hook. Then answer four checks honestly --
-a "false" with a clear reason is a good outcome, not a failure:
+Product relevance, 0-3
+  0 = no demonstrated connection to the offer
+  1 = broad connection to finance
+  2 = concerns accounts payable work
+  3 = explicitly concerns invoice-to-PO matching or discrepancy review
 
-1. "Evidence": does an identifiable source support the exact claim?
-2. "Role relevance": does the finding concern this person's responsibilities or team?
-3. "Product relevance": is there a specific connection to our two stated
-   capabilities (invoice-to-PO matching, routing discrepancies to a reviewer)?
-   A company merely being large, funded or growing is NOT a specific connection.
-4. "Timeliness": is there evidence this still matters now (a date within roughly
-   the last 12 months, an active posting, or an ongoing programme)?
+Prospect relevance, 0-3
+  0 = no demonstrated connection to the person's work
+  1 = company-wide development
+  2 = directly concerns the person's team or function
+  3 = evidence shows the person owns or publicly discussed this specific initiative
 
-If no finding has a specific connection to our capabilities AND relevance to this
-person's work, set "sufficient" to false.
+Evidence quality, 0-2
+  0 = unsupported or contradicted
+  1 = credible secondary reporting supports the specific claim
+  2 = a direct source supports the claim, such as the company's job posting or
+      the person's own statement
 
-Return JSON only:
+Timeliness, 0-2
+  0 = stale or undated, with no evidence it still matters
+  1 = dated and plausibly relevant today
+  2 = demonstrably current, such as an open role or ongoing initiative
+
+Score what the source establishes, and nothing more:
+- A recently published article about an old event does NOT automatically earn 2
+  for timeliness. Date the event, not the page.
+- A finance job title alone does NOT prove the person owns a particular
+  initiative. That is a 3 for prospect relevance only when the evidence shows
+  them owning or publicly discussing this specific thing.
+- A company being large, funded, growing or newsworthy is NOT a connection to
+  our offer. That is 0 for product relevance.
+- You are scoring the strength of an outreach angle. You are NOT predicting
+  whether they will buy, and you must not reason about that.
+
+Return JSON only, with one entry per finding_id given above and no others:
 {{
-  "selected_index": 0,
-  "sufficient": true,
-  "selection_reason": "one sentence on why this finding beats the others",
-  "insufficient_reason": "if sufficient is false: two sentences on what the evidence does and does not support. Empty string otherwise.",
-  "checks": [
-    {{"name": "Evidence", "passed": true, "reason": "short reason"}},
-    {{"name": "Role relevance", "passed": true, "reason": "short reason"}},
-    {{"name": "Product relevance", "passed": true, "reason": "short reason"}},
-    {{"name": "Timeliness", "passed": true, "reason": "short reason"}}
+  "scores": [
+    {{
+      "finding_id": "f-1",
+      "product_relevance": 0,
+      "prospect_relevance": 0,
+      "evidence_quality": 0,
+      "timeliness": 0,
+      "product_relevance_reason": "at most 15 words on what the source shows",
+      "prospect_relevance_reason": "at most 15 words",
+      "evidence_quality_reason": "at most 15 words",
+      "timeliness_reason": "at most 15 words"
+    }}
   ]
 }}
+
+Every finding_id above must appear exactly once. Do not invent a finding_id, do
+not merge findings, and do not add any other field.
 """.strip()
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,25 @@ PROV_SOURCE_TEXT = "source_text"        # verified against grounded source text
 PROV_SEARCH_SUMMARY = "search_summary"  # search-result snippet / grounding segment
 PROV_MODEL = "model_generated"          # model's own words
 
+# ---------------------------------------------------------------------------
+# Signal scoring rubric. 10 points total, fixed weights -- the model supplies
+# the four integers and a reason for each; Python validates, totals and sorts.
+# The total scores the strength of the outreach angle. It is NOT a prediction
+# that the prospect will buy.
+# ---------------------------------------------------------------------------
+SCORE_COMPONENTS: list[tuple[str, str, int]] = [
+    ("product_relevance", "Product relevance", 3),
+    ("prospect_relevance", "Prospect relevance", 3),
+    ("evidence_quality", "Evidence quality", 2),
+    ("timeliness", "Timeliness", 2),
+]
+SCORE_MAX = sum(maximum for _, _, maximum in SCORE_COMPONENTS)
+
+# How a scored finding may be used.
+ELIGIBLE = "eligible"            # can be selected and can generate a draft
+CONTEXT_ONLY = "context_only"    # real, but no product or prospect connection
+EXCLUDED = "excluded"            # unsupported/contradicted, or a duplicate
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -77,6 +96,7 @@ class Finding:
     publisher: str                  # e.g. "Acme Corp careers site"
     url: str
     date: str = ""                  # "" when the source gives no date
+    finding_id: str = ""            # stable id ("f-1"), assigned before scoring
     source_id: str = ""             # links back to a Source.short_id
     kind: str = ""                  # job posting / announcement / interview / ...
     quote: str = ""                 # only populated when verified
@@ -91,6 +111,63 @@ class Finding:
     def from_dict(cls, d: dict[str, Any]) -> "Finding":
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in d.items() if k in known})
+
+
+@dataclass
+class Score:
+    """One finding's rubric scores, keyed by the finding's stable id.
+
+    The four integers come from the model; the total, the ordering and the
+    eligibility verdict are computed in Python so they can be checked.
+    """
+
+    finding_id: str
+    product_relevance: int = 0
+    prospect_relevance: int = 0
+    evidence_quality: int = 0
+    timeliness: int = 0
+    # component key -> the model's short reason for that score
+    reasons: dict[str, str] = field(default_factory=dict)
+    eligibility: str = ELIGIBLE
+    eligibility_reason: str = ""
+
+    @property
+    def total(self) -> int:
+        return (
+            self.product_relevance
+            + self.prospect_relevance
+            + self.evidence_quality
+            + self.timeliness
+        )
+
+    def components(self) -> list[tuple[str, str, int, int, str]]:
+        """``(key, label, value, maximum, reason)`` in rubric order."""
+        return [
+            (key, label, int(getattr(self, key)), maximum, self.reasons.get(key, ""))
+            for key, label, maximum in SCORE_COMPONENTS
+        ]
+
+    def sort_key(self) -> tuple[int, int, int, int, int]:
+        """Total first, then the documented tie-breaks, highest wins."""
+        return (
+            self.total,
+            self.product_relevance,
+            self.prospect_relevance,
+            self.evidence_quality,
+            self.timeliness,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["total"] = self.total          # stored so history needs no recompute
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Score":
+        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        payload = {k: v for k, v in d.items() if k in known}
+        payload["reasons"] = dict(payload.get("reasons") or {})
+        return cls(**payload)
 
 
 @dataclass
@@ -129,6 +206,7 @@ class Identity:
 @dataclass
 class Draft:
     subject: str = ""
+    finding_id: str = ""             # the signal this draft was written from
     body: str = ""
     edited_subject: str = ""
     edited_body: str = ""
@@ -175,6 +253,15 @@ class Run:
     sources: list[Source] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
 
+    # Ranking. ``scores`` is one entry per finding; ``ranking`` is finding_ids
+    # in display order (eligible by total desc, then context-only, then
+    # excluded). ``recommended_id`` is the app's pick and never changes;
+    # ``active_id`` is what the human is actually reviewing.
+    scores: list[Score] = field(default_factory=list)
+    ranking: list[str] = field(default_factory=list)
+    recommended_id: str = ""
+    active_id: str = ""
+
     selected_index: int = -1
     selection_reason: str = ""
     checks: list[Check] = field(default_factory=list)
@@ -191,9 +278,73 @@ class Run:
         self.updated_at = _now()
 
     def selected_finding(self) -> Finding | None:
+        """The finding the reviewer is currently looking at.
+
+        ``active_id`` is authoritative once a run has been ranked;
+        ``selected_index`` is kept in step with it so runs saved before ranking
+        existed still open, and so history can read the signal cheaply.
+        """
+        if self.active_id:
+            found = self.finding_by_id(self.active_id)
+            if found is not None:
+                return found
         if 0 <= self.selected_index < len(self.findings):
             return self.findings[self.selected_index]
         return None
+
+    def finding_by_id(self, finding_id: str) -> Finding | None:
+        if not finding_id:
+            return None
+        for f in self.findings:
+            if f.finding_id == finding_id:
+                return f
+        return None
+
+    def index_of(self, finding_id: str) -> int:
+        for i, f in enumerate(self.findings):
+            if f.finding_id == finding_id:
+                return i
+        return -1
+
+    def score_for(self, finding_id: str) -> Score | None:
+        for sc in self.scores:
+            if sc.finding_id == finding_id:
+                return sc
+        return None
+
+    def has_ranking(self) -> bool:
+        """False for runs saved before ranked signals existed."""
+        return bool(self.scores and self.ranking)
+
+    def ranked_findings(self, eligibility: str | None = None) -> list[tuple[int, Finding, Score]]:
+        """``(rank, finding, score)`` in ranking order, rank 1-based per group."""
+        out: list[tuple[int, Finding, Score]] = []
+        rank = 0
+        for fid in self.ranking:
+            finding = self.finding_by_id(fid)
+            score = self.score_for(fid)
+            if finding is None or score is None:
+                continue
+            if score.eligibility == ELIGIBLE:
+                rank += 1
+            if eligibility is not None and score.eligibility != eligibility:
+                continue
+            out.append((rank if score.eligibility == ELIGIBLE else 0, finding, score))
+        return out
+
+    def set_active_finding(self, finding_id: str) -> bool:
+        """Point the run at one finding. Returns False for an unknown id."""
+        idx = self.index_of(finding_id)
+        if idx < 0:
+            return False
+        self.active_id = finding_id
+        self.selected_index = idx
+        return True
+
+    def recommendation_was_overridden(self) -> bool:
+        return bool(
+            self.recommended_id and self.active_id and self.recommended_id != self.active_id
+        )
 
     def checks_met(self) -> tuple[int, int]:
         return sum(1 for c in self.checks if c.passed), len(self.checks)
@@ -225,6 +376,10 @@ class Run:
             "identity": self.identity.to_dict(),
             "sources": [s.to_dict() for s in self.sources],
             "findings": [f.to_dict() for f in self.findings],
+            "scores": [sc.to_dict() for sc in self.scores],
+            "ranking": list(self.ranking),
+            "recommended_id": self.recommended_id,
+            "active_id": self.active_id,
             "selected_index": self.selected_index,
             "selection_reason": self.selection_reason,
             "checks": [c.to_dict() for c in self.checks],
@@ -253,6 +408,10 @@ class Run:
         run.identity = Identity.from_dict(d.get("identity", {}) or {})
         run.sources = [Source.from_dict(s) for s in d.get("sources", []) or []]
         run.findings = [Finding.from_dict(f) for f in d.get("findings", []) or []]
+        run.scores = [Score.from_dict(sc) for sc in d.get("scores", []) or []]
+        run.ranking = list(d.get("ranking", []) or [])
+        run.recommended_id = d.get("recommended_id", "") or ""
+        run.active_id = d.get("active_id", "") or ""
         run.selected_index = d.get("selected_index", -1)
         run.selection_reason = d.get("selection_reason", "")
         run.checks = [Check.from_dict(c) for c in d.get("checks", []) or []]

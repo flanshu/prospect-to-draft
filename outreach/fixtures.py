@@ -16,6 +16,7 @@ import time
 from typing import Callable
 
 from .schema import (
+    CONTEXT_ONLY,
     PROV_SEARCH_SUMMARY,
     PROV_SOURCE_TEXT,
     STATUS_AWAITING_REVIEW,
@@ -27,6 +28,7 @@ from .schema import (
     Finding,
     Identity,
     Run,
+    Score,
     Source,
 )
 
@@ -41,6 +43,14 @@ _A_QUOTE = (
 
 
 def _fixture_a() -> Run:
+    """Happy path, built so the ranking is readable during a demo.
+
+    Three findings, scored with the real rubric: an open AP role that names
+    invoice-to-PO matching (9), the prospect's own remark about manual finance
+    work (7), and a funding round that scores 5 but is context only because it
+    has no product connection. The two eligible signals make the alternative
+    switch demonstrable with no API key.
+    """
     run = Run(
         prospect_name="Priya Raghavan",
         company="Northwind Logistics",
@@ -84,12 +94,25 @@ def _fixture_a() -> Run:
         ),
         Source(
             short_id="src-3",
-            title="Northwind opens second distribution hub in Coimbatore",
-            url="https://freightweekly.example/news/northwind-coimbatore-hub",
+            title="“We spend too long chasing paperwork” — Northwind's finance lead on scaling",
+            url="https://freightweekly.example/interviews/northwind-finance-operations",
             domain="freightweekly.example",
             supported_claims=[{
-                "text_segment": "Northwind Logistics opened a second distribution hub in Coimbatore.",
-                "confidence": 0.84,
+                "text_segment": (
+                    "Priya Raghavan said her team is working to reduce manual, "
+                    "spreadsheet-driven steps across finance as Northwind grows."
+                ),
+                "confidence": 0.88,
+            }],
+        ),
+        Source(
+            short_id="src-4",
+            title="Northwind Logistics raises a 24 million dollar Series B",
+            url="https://freightweekly.example/news/northwind-series-b",
+            domain="freightweekly.example",
+            supported_claims=[{
+                "text_segment": "Northwind Logistics raised a 24 million dollar Series B led by Calder Partners.",
+                "confidence": 0.9,
             }],
         ),
     ]
@@ -103,6 +126,7 @@ def _fixture_a() -> Run:
             publisher="Northwind Logistics careers site",
             url="https://northwind-logistics.example/careers/accounts-payable-analyst",
             date="2026-10-28",
+            finding_id="f-1",
             source_id="src-2",
             kind="job posting",
             quote=_A_QUOTE,
@@ -112,52 +136,92 @@ def _fixture_a() -> Run:
         ),
         Finding(
             claim=(
-                "Northwind Logistics opened a second distribution hub in Coimbatore in "
-                "September 2026."
+                "In a trade-press interview, Priya Raghavan said her team is working to "
+                "reduce manual, spreadsheet-driven steps across finance as the company grows."
             ),
             publisher="Freight Weekly",
-            url="https://freightweekly.example/news/northwind-coimbatore-hub",
-            date="2026-09-16",
+            url="https://freightweekly.example/interviews/northwind-finance-operations",
+            date="2026-07-09",
+            finding_id="f-2",
             source_id="src-3",
-            kind="news",
+            kind="interview",
             provenance=PROV_SEARCH_SUMMARY,
             verification_note="Claim corroborated by the source page; shown as paraphrase.",
         ),
         Finding(
             claim=(
-                "Priya Raghavan is listed as Head of Finance Operations on the company's "
-                "leadership page."
+                "Northwind Logistics raised a 24 million dollar Series B led by Calder "
+                "Partners in October 2026."
             ),
-            publisher="Northwind Logistics",
-            url="https://northwind-logistics.example/about/leadership",
-            date="",
-            source_id="src-1",
-            kind="official page",
+            publisher="Freight Weekly",
+            url="https://freightweekly.example/news/northwind-series-b",
+            date="2026-10-02",
+            finding_id="f-3",
+            source_id="src-4",
+            kind="news",
             provenance=PROV_SEARCH_SUMMARY,
             verification_note="Claim corroborated by the source page; shown as paraphrase.",
         ),
     ]
-    run.selected_index = 0
+    run.scores = [
+        Score(
+            finding_id="f-1",
+            product_relevance=3, prospect_relevance=2, evidence_quality=2, timeliness=2,
+            reasons={
+                "product_relevance": "Names invoice-to-PO matching and mismatch escalation outright.",
+                "prospect_relevance": "An AP role inside the finance function she runs.",
+                "evidence_quality": "The company's own job posting states the duties.",
+                "timeliness": "Posted 28 October 2026 and still open.",
+            },
+        ),
+        Score(
+            finding_id="f-2",
+            product_relevance=1, prospect_relevance=3, evidence_quality=2, timeliness=1,
+            reasons={
+                "product_relevance": "Manual finance work broadly, with no mention of invoices or POs.",
+                "prospect_relevance": "Her own statement about her own team's priority.",
+                "evidence_quality": "A direct quote from the prospect in a trade interview.",
+                "timeliness": "Dated July 2026; plausibly still her priority, but not shown.",
+            },
+        ),
+        Score(
+            finding_id="f-3",
+            product_relevance=0, prospect_relevance=1, evidence_quality=2, timeliness=2,
+            reasons={
+                "product_relevance": "Funding says nothing about invoice matching or discrepancy review.",
+                "prospect_relevance": "Company-wide event, not her function specifically.",
+                "evidence_quality": "Reported with the lead investor named and confirmed by the company.",
+                "timeliness": "Announced October 2026, clearly current.",
+            },
+        ),
+    ]
+    run.scores[2].eligibility = CONTEXT_ONLY
+    run.scores[2].eligibility_reason = (
+        "No demonstrated connection to invoice-to-PO matching or discrepancy review, so "
+        "it is context only and cannot generate a draft."
+    )
+    run.ranking = ["f-1", "f-2", "f-3"]
+    run.recommended_id = "f-1"
+    run.set_active_finding("f-1")
     run.selection_reason = (
-        "The job posting is the only finding that names invoice-to-PO matching and "
-        "mismatch escalation — the exact work our product does — and it sits inside "
-        "the team this person runs."
+        "It scores 9 of 10 against 7 for the runner-up (“In a trade-press interview, "
+        "Priya Raghavan said her team is working…”), mainly on product relevance: 3 "
+        "against 1 — the posting names invoice-to-PO matching and mismatch escalation "
+        "outright."
     )
     run.checks = [
-        Check("Evidence", True,
-              "The company's own careers page states the matching and escalation duties; "
-              "the quoted sentence was matched verbatim."),
-        Check("Role relevance", True,
-              "The posting is an Accounts Payable role, and this prospect heads Finance "
-              "Operations, so the role reports into her function."),
         Check("Product relevance", True,
-              "The posting names invoice-to-PO matching and escalation of mismatches, "
-              "which maps directly to our two stated capabilities."),
+              "3 of 3 — Names invoice-to-PO matching and mismatch escalation outright."),
+        Check("Prospect relevance", True,
+              "2 of 3 — An AP role inside the finance function she runs."),
+        Check("Evidence quality", True,
+              "2 of 2 — The company's own job posting states the duties."),
         Check("Timeliness", True,
-              "The posting is dated 28 October 2026 and is still listed as open."),
+              "2 of 2 — Posted 28 October 2026 and still open."),
     ]
     run.draft = Draft(
         subject="Your AP analyst posting at Northwind",
+        finding_id="f-1",
         body=(
             "Hi Priya,\n\n"
             "I came across Northwind's Accounts Payable Analyst posting — it says the role "
@@ -173,18 +237,39 @@ def _fixture_a() -> Run:
     run.status = STATUS_AWAITING_REVIEW
     run.stage_log = [
         {"at": "", "stage": "Identity", "message": "Searching for public evidence on Priya Raghavan at Northwind Logistics."},
-        {"at": "", "stage": "Identity", "message": "3 search(es) run, 3 source(s) cited."},
+        {"at": "", "stage": "Identity", "message": "3 search(es) run, 4 source(s) cited."},
         {"at": "", "stage": "Identity", "message": "Identity confirmed. " + run.identity.confidence_reason},
         {"at": "", "stage": "Research", "message": "Searching company pages, job postings, announcements and interviews."},
         {"at": "", "stage": "Research", "message": "Verifying 3 finding(s) against their sources."},
         {"at": "", "stage": "Research", "message": "Northwind Logistics careers site: Quote matched verbatim on the source page."},
         {"at": "", "stage": "Research", "message": "3 of 3 finding(s) verified and usable."},
-        {"at": "", "stage": "Signal selection", "message": "Comparing 3 verified finding(s) against our offer."},
-        {"at": "", "stage": "Signal selection", "message": "Selected the AP Analyst posting (4 of 4 checks met)."},
+        {"at": "", "stage": "Signal selection", "message": "Scoring 3 verified finding(s) against the 10-point rubric."},
+        {"at": "", "stage": "Signal selection", "message": "Ranked 2 eligible signal(s); recommending f-1 at 9 of 10. 1 context-only finding(s) below."},
         {"at": "", "stage": "Draft", "message": "Writing a first-contact email from the selected evidence."},
         {"at": "", "stage": "Human review", "message": "Draft ready for the salesperson to edit, approve or reject."},
     ]
     return run
+
+
+# The canned draft for fixture A's runner-up signal, so switching signals is
+# demonstrable with no API key. Fixture content: the person, company and source
+# are fictional, and no model wrote this.
+_A_ALTERNATE_DRAFTS: dict[str, Draft] = {
+    "f-2": Draft(
+        subject="The manual steps you mentioned at Northwind",
+        finding_id="f-2",
+        body=(
+            "Hi Priya,\n\n"
+            "I read your Freight Weekly interview, where you talked about cutting the "
+            "manual, spreadsheet-driven steps in finance as Northwind grows.\n\n"
+            "We work on one slice of that: matching supplier invoices to purchase orders, "
+            "and routing the ones that disagree to a reviewer. I'd rather not guess which "
+            "steps you meant — which part of the finance month still runs on spreadsheets "
+            "today?\n\n"
+            "Best,\n[Your name]"
+        ),
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +354,11 @@ def _fixture_b() -> Run:
 # C -- weak signal (identity fine, evidence irrelevant)
 # ---------------------------------------------------------------------------
 def _fixture_c() -> Run:
+    """Weak signal: identity fine, findings verified, nothing eligible.
+
+    Every finding scores 0 for product relevance, so all three are context only
+    and the run refuses to draft — even though one of them totals 7 of 10.
+    """
     run = Run(
         prospect_name="Daniel Okafor",
         company="Lumenbridge Studios",
@@ -306,7 +396,7 @@ def _fixture_c() -> Run:
             claim="Daniel Okafor gave a talk on real-time rendering pipelines at DevCraft 2026.",
             publisher="DevCraft 2026 programme",
             url="https://devcraft.example/2026/programme", date="2026-06-11",
-            source_id="src-2", kind="interview",
+            finding_id="f-1", source_id="src-2", kind="interview",
             provenance=PROV_SEARCH_SUMMARY,
             verification_note="Claim corroborated by the source page; shown as paraphrase.",
         ),
@@ -314,7 +404,7 @@ def _fixture_c() -> Run:
             claim="Lumenbridge Studios won an art direction award for its 2026 title.",
             publisher="Indie Games Press",
             url="https://indiegamespress.example/lumenbridge-art-award", date="2026-08-02",
-            source_id="src-3", kind="news",
+            finding_id="f-2", source_id="src-3", kind="news",
             provenance=PROV_SEARCH_SUMMARY,
             verification_note="Claim corroborated by the source page; shown as paraphrase.",
         ),
@@ -322,41 +412,72 @@ def _fixture_c() -> Run:
             claim="Lumenbridge Studios lists 42 employees on its team page.",
             publisher="Lumenbridge Studios",
             url="https://lumenbridge.example/team", date="",
-            source_id="src-1", kind="official page",
+            finding_id="f-3", source_id="src-1", kind="official page",
             provenance=PROV_SEARCH_SUMMARY,
             verification_note="Claim corroborated by the source page; shown as paraphrase.",
         ),
     ]
-    run.selected_index = 0
-    run.selection_reason = (
-        "The conference talk is the strongest of the three because it is the prospect's "
-        "own public statement — but it is about rendering engineering, not finance "
-        "operations."
+    _context_only = (
+        "No demonstrated connection to invoice-to-PO matching or discrepancy review, so "
+        "it is context only and cannot generate a draft."
     )
-    run.checks = [
-        Check("Evidence", True, "The DevCraft programme page names him and the talk topic."),
-        Check("Role relevance", True, "The talk is squarely within his engineering remit."),
-        Check("Product relevance", False,
-              "Nothing found touches accounts payable, invoices, purchase orders or "
-              "finance operations. He runs engineering at a games studio; a rendering "
-              "talk gives no opening to our invoice-matching offer."),
-        Check("Timeliness", True, "The talk is dated June 2026, within the last twelve months."),
+    run.scores = [
+        Score(
+            finding_id="f-1",
+            product_relevance=0, prospect_relevance=3, evidence_quality=2, timeliness=2,
+            reasons={
+                "product_relevance": "Rendering pipelines; nothing to do with invoices or payables.",
+                "prospect_relevance": "He gave the talk himself, squarely in his own remit.",
+                "evidence_quality": "The conference programme names him and the talk.",
+                "timeliness": "June 2026, and the programme is still published.",
+            },
+            eligibility=CONTEXT_ONLY, eligibility_reason=_context_only,
+        ),
+        Score(
+            finding_id="f-2",
+            product_relevance=0, prospect_relevance=1, evidence_quality=1, timeliness=2,
+            reasons={
+                "product_relevance": "An art direction award says nothing about finance work.",
+                "prospect_relevance": "Company-wide recognition, not his function.",
+                "evidence_quality": "Credible trade reporting rather than a direct source.",
+                "timeliness": "Awarded August 2026.",
+            },
+            eligibility=CONTEXT_ONLY, eligibility_reason=_context_only,
+        ),
+        Score(
+            finding_id="f-3",
+            product_relevance=0, prospect_relevance=1, evidence_quality=2, timeliness=0,
+            reasons={
+                "product_relevance": "Headcount is not a connection to our offer.",
+                "prospect_relevance": "Company-wide, and only incidentally about him.",
+                "evidence_quality": "The company's own team page.",
+                "timeliness": "The page carries no date.",
+            },
+            eligibility=CONTEXT_ONLY, eligibility_reason=_context_only,
+        ),
     ]
+    run.ranking = ["f-1", "f-2", "f-3"]
+    run.recommended_id = ""
+    run.active_id = ""
+    run.selected_index = -1
+    run.selection_reason = ""
+    run.checks = []
     run.status = STATUS_INSUFFICIENT_EVIDENCE
     run.stop_reason = (
-        "Identity is confirmed, but none of the three verified findings connects this "
-        "person or their team to invoice-to-PO matching or discrepancy review. Writing "
-        "outreach from this evidence would mean inventing a reason to make contact, so "
-        "the run stops here. 3 of 4 checks met does not override the failed product "
-        "relevance check."
+        "Research completed and all three findings were scored, but none has any "
+        "demonstrated connection to invoice-to-PO matching or discrepancy review, so "
+        "there is no honest reason to write. The strongest of them — his rendering talk "
+        "— totals 7 of 10 on the strength of his own involvement and good sourcing, and "
+        "is still context only: a high total cannot buy a product connection that the "
+        "evidence does not show."
     )
     run.stage_log = [
         {"at": "", "stage": "Identity", "message": "Searching for public evidence on Daniel Okafor at Lumenbridge Studios."},
         {"at": "", "stage": "Identity", "message": "Identity confirmed. " + run.identity.confidence_reason},
         {"at": "", "stage": "Research", "message": "Searching company pages, job postings, announcements and interviews."},
         {"at": "", "stage": "Research", "message": "3 of 3 finding(s) verified and usable."},
-        {"at": "", "stage": "Signal selection", "message": "Comparing 3 verified finding(s) against our offer."},
-        {"at": "", "stage": "Signal selection", "message": "No credible connection to our offer (3 of 4 checks met). Stopping."},
+        {"at": "", "stage": "Signal selection", "message": "Scoring 3 verified finding(s) against the 10-point rubric."},
+        {"at": "", "stage": "Signal selection", "message": "No eligible signal after scoring. Stopping with 'Insufficient evidence'."},
     ]
     return run
 
@@ -391,11 +512,30 @@ def _fixture_d() -> Run:
     return run
 
 
+def alternate_draft(fixture_id: str, finding_id: str) -> Draft | None:
+    """A canned draft for one of a fixture's other signals, or None.
+
+    This is what makes "Use this signal" demonstrable with no API key: fixture
+    mode takes the stored draft instead of calling the model. It is fixture
+    content, written by hand, and labelled as such in the UI.
+    """
+    base = (fixture_id or "").split()[0].upper() if fixture_id else ""
+    if base != "A":
+        return None
+    if finding_id == "f-1":
+        # The draft the run opens with. Stored by reference rather than copied,
+        # so switching back during a demo returns the identical email.
+        return Draft.from_dict(_fixture_a().draft.to_dict())
+    stored = _A_ALTERNATE_DRAFTS.get(finding_id)
+    return Draft.from_dict(stored.to_dict()) if stored else None
+
+
 FIXTURES: dict[str, dict[str, object]] = {
     "A": {
         "label": "A · Happy path — Priya Raghavan, Northwind Logistics",
-        "summary": "Clearly identified prospect, a verified job posting that names invoice-to-PO "
-                   "matching, four of four checks met, draft ready for review.",
+        "summary": "Clearly identified prospect and three scored findings: a verified AP posting "
+                   "at 9 of 10, her own interview at 7, and a funding round at 5 that is "
+                   "context only. Switching to the runner-up works without an API key.",
         "expected": "Awaiting review",
         "build": _fixture_a,
     },
@@ -408,8 +548,9 @@ FIXTURES: dict[str, dict[str, object]] = {
     },
     "C": {
         "label": "C · Weak signal — Daniel Okafor, Lumenbridge Studios",
-        "summary": "Identity confirmed and findings verified, but nothing connects him to invoice "
-                   "matching. The run records why it refused to draft.",
+        "summary": "Identity confirmed and all three findings verified and scored — the best of "
+                   "them reaching 7 of 10 — but none connects to invoice matching, so every one "
+                   "is context only and the run refuses to draft.",
         "expected": "Insufficient evidence",
         "build": _fixture_c,
     },
@@ -445,6 +586,10 @@ def replay(
     live.sources = []
     live.checks = []
     live.draft = Draft()
+    live.scores = []
+    live.ranking = []
+    live.recommended_id = ""
+    live.active_id = ""
     live.selected_index = -1
 
     if on_stage:
@@ -459,12 +604,19 @@ def replay(
                 live.findings = final.findings
         elif entry["stage"] == "Signal selection":
             live.sources, live.findings = final.sources, final.findings
-            if "Selected" in entry["message"] or "Stopping" in entry["message"]:
+            # The ranking appears when the stage that produced it completes.
+            if "Ranked" in entry["message"] or "Stopping" in entry["message"]:
+                live.scores = final.scores
+                live.ranking = final.ranking
+                live.recommended_id = final.recommended_id
+                live.active_id = final.active_id
                 live.checks = final.checks
                 live.selected_index = final.selected_index
                 live.selection_reason = final.selection_reason
         elif entry["stage"] in ("Draft", "Human review"):
             live.sources, live.findings = final.sources, final.findings
+            live.scores, live.ranking = final.scores, final.ranking
+            live.recommended_id, live.active_id = final.recommended_id, final.active_id
             live.checks, live.selected_index = final.checks, final.selected_index
         if on_stage:
             on_stage(live)

@@ -200,13 +200,42 @@ class Store:
 
 
 def _signal_text(payload: dict[str, Any]) -> str:
-    """The selected finding's claim, or the reason there isn't one."""
+    """The active finding's claim with its score, or the reason there isn't one.
+
+    Reads the stored payload only -- the history view never re-scores anything.
+    """
     findings = payload.get("findings") or []
-    idx = payload.get("selected_index", -1)
-    if isinstance(idx, int) and 0 <= idx < len(findings):
-        claim = (findings[idx] or {}).get("claim", "")
-        if claim:
-            return claim
+    claim = ""
+    score_total: int | None = None
+
+    active = payload.get("active_id") or ""
+    if active:
+        for f in findings:
+            if (f or {}).get("finding_id") == active:
+                claim = (f or {}).get("claim", "")
+                break
+        for sc in payload.get("scores") or []:
+            if (sc or {}).get("finding_id") == active:
+                total = (sc or {}).get("total")
+                if isinstance(total, int):
+                    score_total = total
+                break
+    if not claim:
+        idx = payload.get("selected_index", -1)
+        if isinstance(idx, int) and 0 <= idx < len(findings):
+            claim = (findings[idx] or {}).get("claim", "")
+
+    if claim:
+        suffix = ""
+        if score_total is not None:
+            suffix = f" · {score_total} of 10"
+            recommended = payload.get("recommended_id") or ""
+            if recommended and active and recommended != active:
+                suffix += " · reviewer's choice"
+        elif payload.get("findings"):
+            suffix = " · no score recorded"
+        return claim + suffix
+
     status = payload.get("status", "")
     if status == "Needs clarification":
         return "— paused before research: identity not confirmed"

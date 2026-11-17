@@ -12,9 +12,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from outreach import config, fixtures, verify  # noqa: E402
-from outreach.pipeline import _strip_unverified_quotes, stage_signal  # noqa: E402
+import pytest  # noqa: E402
+
+from outreach import config, fixtures, pipeline, verify  # noqa: E402
+from outreach.gemini_client import ResearchProviderError  # noqa: E402
+from outreach.pipeline import _strip_unverified_quotes, stage_score  # noqa: E402
+from outreach.store import _signal_text  # noqa: E402
 from outreach.schema import (  # noqa: E402
+    CONTEXT_ONLY,
+    ELIGIBLE,
+    EXCLUDED,
     PROV_MODEL,
     PROV_SEARCH_SUMMARY,
     PROV_SOURCE_TEXT,
@@ -108,29 +115,24 @@ def test_draft_guardrail_strips_unverified_quotes():
     assert removed2 == 0 and '"we have a massive invoice backlog"' in kept
 
 
-def test_failed_evidence_check_overrides_tally(monkeypatch):
-    """3-of-4 must never produce a draft when the evidence check fails."""
-    import outreach.pipeline as pipeline
-
+def test_a_high_total_never_overrides_a_failed_evidence_gate(monkeypatch):
+    """8 of 10 must never produce a draft when the evidence is unsupported."""
     run = Run(prospect_name="A B", company="C")
     run.findings = [
-        Finding(claim="x", publisher="p", url="u", provenance=PROV_SEARCH_SUMMARY)
+        Finding(claim="They are replacing their AP system", publisher="p", url="u",
+                finding_id="f-1", provenance=PROV_SEARCH_SUMMARY),
     ]
-    monkeypatch.setattr(pipeline, "json_call", lambda *a, **k: {
-        "selected_index": 0,
-        "sufficient": True,
-        "selection_reason": "only option",
-        "checks": [
-            {"name": "Evidence", "passed": False, "reason": "no source states this"},
-            {"name": "Role relevance", "passed": True, "reason": "ok"},
-            {"name": "Product relevance", "passed": True, "reason": "ok"},
-            {"name": "Timeliness", "passed": True, "reason": "ok"},
-        ],
-    })
-    stage_signal(run)
+    monkeypatch.setattr(pipeline, "json_call", lambda *a, **k: {"scores": [{
+        "finding_id": "f-1",
+        "product_relevance": 3, "prospect_relevance": 3,
+        "evidence_quality": 0, "timeliness": 2,
+        "evidence_quality_reason": "no source states this",
+    }]})
+    stage_score(run)
     assert run.status == STATUS_INSUFFICIENT_EVIDENCE
-    assert run.checks_met() == (3, 4)
-    assert not run.draft.subject
+    assert run.score_for("f-1").total == 8
+    assert run.score_for("f-1").eligibility == EXCLUDED
+    assert not run.draft.subject and run.active_id == ""
 
 
 def test_fixtures_have_expected_outcomes():
@@ -146,9 +148,9 @@ def test_fixtures_have_expected_outcomes():
         assert run.mode == "fixture"
     a = fixtures.build("A")
     assert a.draft.subject and a.selected_finding() is not None
-    assert a.checks_met() == (4, 4)
+    assert a.checks_met() == (4, 4)     # every rubric component scored above zero
     c = fixtures.build("C")
-    assert c.checks_met() == (3, 4) and c.stop_reason
+    assert c.stop_reason and not c.checks
     assert not c.draft.subject          # weak signal must not produce a draft
 
 
@@ -262,9 +264,9 @@ def test_full_workflow_happy_path(monkeypatch):
             "url": "https://aurora-freight.example/careers/ap-analyst",
             "date": "2026-10-01", "kind": "job posting", "quote": "",
         }]},
-        {"selected_index": 0, "sufficient": True, "selection_reason": "only one on point",
-         "checks": [{"name": n, "passed": True, "reason": "ok"} for n in
-                    ("Evidence", "Role relevance", "Product relevance", "Timeliness")]},
+        {"scores": [{"finding_id": "f-1", "product_relevance": 3, "prospect_relevance": 2,
+                     "evidence_quality": 2, "timeliness": 2,
+                     "product_relevance_reason": "names invoice-to-PO matching"}]},
         {"subject": "Your AP analyst posting", "body": "Hi — how does your team handle "
                                                        "mismatches today?"},
     ])
@@ -276,6 +278,8 @@ def test_full_workflow_happy_path(monkeypatch):
     assert run.draft.subject and run.draft.body
     assert run.selected_finding().url.endswith("/ap-analyst")
     assert run.checks_met() == (4, 4)
+    assert run.recommended_id == "f-1" and run.active_id == "f-1"
+    assert run.score_for("f-1").total == 9 and run.draft.finding_id == "f-1"
     assert "Identity" in stages and "Human review" in stages
 
 
@@ -336,6 +340,384 @@ def test_missing_credentials_reports_research_incomplete(monkeypatch):
     execute(run)
     assert run.status == STATUS_RESEARCH_INCOMPLETE
     assert "GOOGLE_API_KEY" in run.error
+
+
+# ---------------------------------------------------------------------------
+# Ranked signals: scoring validation, ordering, eligibility gates, and the
+# human switching signal without repeating any research.
+# ---------------------------------------------------------------------------
+def _run_with_findings(claims: list[str]) -> Run:
+    run = Run(prospect_name="Priya Raghavan", company="Northwind Logistics")
+    run.findings = [
+        Finding(
+            claim=claim,
+            publisher="p",
+            url=f"https://src.example/{i}",
+            provenance=PROV_SEARCH_SUMMARY,
+            verification_note="corroborated",
+        )
+        for i, claim in enumerate(claims)
+    ]
+    pipeline._assign_finding_ids(run)
+    return run
+
+
+DISTINCT_CLAIMS = [
+    "An open accounts payable analyst posting lists three-way matching of supplier "
+    "invoices against purchase orders",
+    "The prospect said her finance team wants to cut manual spreadsheet reconciliation "
+    "this year",
+    "The company raised a Series B funding round led by Calder Partners",
+]
+
+
+def _score_row(fid, product, prospect, evidence, timeliness, **reasons):
+    row = {
+        "finding_id": fid,
+        "product_relevance": product,
+        "prospect_relevance": prospect,
+        "evidence_quality": evidence,
+        "timeliness": timeliness,
+    }
+    row.update(reasons)
+    return row
+
+
+def _with_scores(monkeypatch, rows):
+    monkeypatch.setattr(pipeline, "json_call", lambda *a, **k: {"scores": rows})
+
+
+def test_ranking_orders_by_total_and_sets_recommendation(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS)
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 3, 2, 2, 2, product_relevance_reason="names invoice-to-PO matching"),
+        _score_row("f-2", 1, 3, 2, 1),
+        _score_row("f-3", 0, 1, 2, 2),
+    ])
+    pipeline.stage_score(run)
+
+    assert run.ranking == ["f-1", "f-2", "f-3"]            # 9, 7, then context only
+    assert run.recommended_id == "f-1" and run.active_id == "f-1"
+    assert run.score_for("f-1").total == 9
+    assert [s.eligibility for s in run.scores] == [ELIGIBLE, ELIGIBLE, CONTEXT_ONLY]
+    assert "9 of 10" in run.selection_reason and "7" in run.selection_reason
+    assert not run.recommendation_was_overridden()
+
+
+def test_context_only_sits_below_eligible_even_with_a_higher_total(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS[:2])
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 0, 3, 2, 2),        # 7, but no product connection
+        _score_row("f-2", 2, 1, 1, 1),        # 5, eligible
+    ])
+    pipeline.stage_score(run)
+
+    assert run.ranking == ["f-2", "f-1"]
+    assert run.score_for("f-1").total > run.score_for("f-2").total
+    assert run.score_for("f-1").eligibility == CONTEXT_ONLY
+    assert run.recommended_id == "f-2"
+
+
+def test_tie_breaks_follow_the_documented_order(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS)
+    # All three total 7. f-2 wins on product relevance; f-3 beats f-1 on
+    # prospect relevance; f-1 is last despite coming first in research order.
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 1, 2, 2, 2),
+        _score_row("f-2", 3, 1, 2, 1),
+        _score_row("f-3", 1, 3, 2, 1),
+    ])
+    pipeline.stage_score(run)
+    assert [s.total for s in run.scores] == [7, 7, 7]
+    assert run.ranking == ["f-2", "f-3", "f-1"]
+
+
+def test_full_tie_preserves_original_research_order(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS)
+    rows = [_score_row(f"f-{i}", 2, 2, 1, 1) for i in (1, 2, 3)]
+    _with_scores(monkeypatch, list(reversed(rows)))   # model order must not matter
+    pipeline.stage_score(run)
+    assert run.ranking == ["f-1", "f-2", "f-3"]
+
+
+def test_unverified_finding_is_excluded_from_ranking_whatever_the_model_says(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS[:2])
+    run.findings[1].provenance = PROV_MODEL          # failed verification
+    run.findings[1].verification_note = "Not verified: the page does not state this."
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 2, 2, 1, 1),
+    ])
+    pipeline.stage_score(run)
+
+    excluded = run.score_for("f-2")
+    assert excluded.eligibility == EXCLUDED and excluded.total == 0
+    assert "No source supports this claim" in excluded.eligibility_reason
+    assert run.ranking[-1] == "f-2"
+    assert run.recommended_id == "f-1"
+
+
+def test_zero_evidence_quality_is_excluded_not_merely_ranked_low(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS[:2])
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 3, 3, 0, 2),      # 8 points, but unsupported
+        _score_row("f-2", 1, 1, 1, 1),      # 4 points, supported
+    ])
+    pipeline.stage_score(run)
+    assert run.score_for("f-1").eligibility == EXCLUDED
+    assert run.recommended_id == "f-2"
+    assert run.status != STATUS_INSUFFICIENT_EVIDENCE      # a weaker signal still qualifies
+
+
+def test_no_eligible_signal_is_insufficient_evidence_not_a_draft(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS)
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 0, 3, 2, 2),
+        _score_row("f-2", 0, 1, 1, 1),
+        _score_row("f-3", 0, 1, 2, 2),
+    ])
+    pipeline.stage_score(run)
+    assert run.status == STATUS_INSUFFICIENT_EVIDENCE
+    assert run.active_id == "" and run.selected_index == -1
+    assert "context only" in run.stop_reason
+    assert not run.draft.subject
+
+
+def test_duplicate_reports_of_one_event_do_not_take_two_ranks(monkeypatch):
+    claim = "The company raised a 24 million dollar Series B led by Calder Partners"
+    run = _run_with_findings([
+        "An accounts payable posting lists matching of supplier invoices to purchase orders",
+        claim,
+        claim + " ",            # the same event from a second outlet
+    ])
+    _with_scores(monkeypatch, [
+        _score_row("f-1", 3, 2, 2, 2),
+        _score_row("f-2", 2, 2, 2, 2),
+        _score_row("f-3", 2, 2, 2, 1),
+    ])
+    pipeline.stage_score(run)
+    eligible = [s.finding_id for s in run.scores if s.eligibility == ELIGIBLE]
+    assert eligible == ["f-1", "f-2"]
+    assert run.score_for("f-3").eligibility == EXCLUDED
+    assert "same event" in run.score_for("f-3").eligibility_reason
+
+
+# ---- malformed scoring output ------------------------------------------------
+def test_scoring_retries_once_then_succeeds(monkeypatch):
+    run = _run_with_findings(DISTINCT_CLAIMS[:1])
+    answers = [
+        {"scores": [{"finding_id": "f-1", "product_relevance": 2}]},        # incomplete
+        {"scores": [_score_row("f-1", 2, 2, 2, 2)]},                        # valid
+    ]
+    monkeypatch.setattr(pipeline, "json_call", lambda *a, **k: answers.pop(0))
+    pipeline.stage_score(run)
+    assert run.recommended_id == "f-1"
+    assert any("Retrying once" in e["message"] for e in run.stage_log)
+
+
+def test_scoring_invalid_twice_is_research_incomplete_with_a_retry(monkeypatch):
+    from outreach.pipeline import execute
+
+    _wire(monkeypatch, json_answers=[
+        {"status": "confirmed", "confidence_reason": "ok", "ambiguity": "", "candidates": []},
+        {"findings": [{
+            "claim": "Aurora Freight is hiring an AP Analyst to match supplier invoices "
+                     "against purchase orders and escalate mismatches.",
+            "publisher": "Aurora Freight careers",
+            "url": "https://aurora-freight.example/careers/ap-analyst",
+            "date": "2026-10-01", "kind": "job posting", "quote": "",
+        }]},
+        {"scores": [_score_row("f-1", 9, 9, 9, 9)]},     # out of range
+        {"scores": [_score_row("f-2", 1, 1, 1, 1)]},     # unknown id
+    ])
+    run = Run(prospect_name="Maya Iyer", company="Aurora Freight")
+    execute(run)
+    assert run.status == STATUS_RESEARCH_INCOMPLETE
+    assert run.status != STATUS_INSUFFICIENT_EVIDENCE
+    assert "scoring" in run.error.lower()
+    assert not run.draft.subject
+
+
+def test_score_validation_rejects_bad_shapes():
+    bad = [
+        ({"scores": []}, "no scores list"),
+        ({"scores": [{"product_relevance": 1}]}, "no finding_id"),
+        ({"scores": [_score_row("f-1", 1, 1, 1, 1), _score_row("f-1", 2, 2, 2, 2)]}, "duplicate"),
+        ({"scores": [_score_row("f-1", 1, 1, 1, 3)]}, "timeliness out of range"),
+        ({"scores": [_score_row("f-1", "two", 1, 1, 1)]}, "non-integer"),
+        ({"scores": [{"finding_id": "f-1", "product_relevance": 1, "prospect_relevance": 1}]}, "missing"),
+        ("not json", "not an object"),
+    ]
+    for payload, why in bad:
+        with pytest.raises(pipeline.ScoringFormatError):
+            pipeline._parse_scores(payload, ["f-1"])
+    # A float that is exactly an integer is accepted; 1.5 is not.
+    ok = pipeline._parse_scores({"scores": [_score_row("f-1", 2.0, 1, 1, 1)]}, ["f-1"])
+    assert ok[0].product_relevance == 2
+    with pytest.raises(pipeline.ScoringFormatError):
+        pipeline._parse_scores({"scores": [_score_row("f-1", 1.5, 1, 1, 1)]}, ["f-1"])
+
+
+def test_missing_score_for_a_candidate_is_rejected():
+    with pytest.raises(pipeline.ScoringFormatError):
+        pipeline._parse_scores({"scores": [_score_row("f-1", 1, 1, 1, 1)]}, ["f-1", "f-2"])
+
+
+# ---- switching signal --------------------------------------------------------
+def test_switching_signal_redrafts_without_repeating_research(monkeypatch):
+    run = fixtures.build("A")
+    searches: list[str] = []
+    monkeypatch.setattr(pipeline, "grounded_search",
+                        lambda *a, **k: searches.append("search"))
+    drafted: list[str] = []
+
+    def fake_draft(*a, **k):
+        drafted.append("draft")
+        return {"subject": "The manual steps you mentioned",
+                "body": "Hi Priya - which part still runs on spreadsheets?"}
+
+    monkeypatch.setattr(pipeline, "json_call", fake_draft)
+    before_sources = [s.url for s in run.sources]
+    before_scores = [(s.finding_id, s.total) for s in run.scores]
+
+    pipeline.redraft(run, "f-2")
+
+    assert searches == []                       # no web research
+    assert len(drafted) == 1                    # exactly one drafting call
+    assert run.active_id == "f-2" and run.draft.finding_id == "f-2"
+    assert run.recommended_id == "f-1"          # the app's pick is still visible
+    assert run.recommendation_was_overridden()
+    assert run.status == STATUS_AWAITING_REVIEW and run.draft.decision == ""
+    assert [s.url for s in run.sources] == before_sources
+    assert [(s.finding_id, s.total) for s in run.scores] == before_scores
+    assert run.checks[0].name == "Product relevance" and "1 of 3" in run.checks[0].reason
+
+
+def test_switching_to_a_context_only_signal_is_refused():
+    run = fixtures.build("A")
+    with pytest.raises(pipeline.SignalNotEligible):
+        pipeline.redraft(run, "f-3")            # the funding announcement
+    assert run.active_id == "f-1"               # unchanged
+    with pytest.raises(pipeline.SignalNotEligible):
+        pipeline.redraft(run, "f-99")           # unknown id
+
+
+def test_failed_regeneration_keeps_the_previous_draft_and_signal(monkeypatch):
+    run = fixtures.build("A")
+    before = (run.draft.subject, run.draft.body, run.active_id, run.status)
+
+    def boom(*a, **k):
+        raise ResearchProviderError("503 the model backend is unavailable")
+
+    monkeypatch.setattr(pipeline, "json_call", boom)
+    with pytest.raises(ResearchProviderError):
+        pipeline.redraft(run, "f-2")
+
+    assert (run.draft.subject, run.draft.body, run.active_id, run.status) == before
+    assert run.draft.finding_id == "f-1"        # evidence and email still agree
+    assert "503" in run.error
+    assert any("previous draft" in e["message"] for e in run.stage_log)
+
+
+def test_fixture_switch_needs_no_model_call():
+    run = fixtures.build("A")
+    canned = fixtures.alternate_draft("A", "f-2")
+    assert canned is not None
+    pipeline.redraft(run, "f-2", draft_fn=lambda r, f: canned)
+    assert run.active_id == "f-2" and run.draft.finding_id == "f-2"
+    assert "spreadsheets" in run.draft.body
+    assert fixtures.alternate_draft("A", "f-3") is None     # context only
+
+
+# ---- the demo flow, end to end, offline -------------------------------------
+def test_demo_flow_switch_approve_reopen(monkeypatch):
+    """Fixture A -> switch to #2 -> approve -> reload from the store."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "demo.db"
+        monkeypatch.setattr(config, "sqlite_path", lambda: db)
+        monkeypatch.setattr(config, "database_url", lambda: None)
+        from outreach.store import Store
+
+        store = Store()
+        run = fixtures.build("A")
+        store.save(run)
+
+        canned = fixtures.alternate_draft("A", "f-2")
+        pipeline.redraft(run, "f-2", draft_fn=lambda r, f: canned)
+        store.save(run)
+
+        run.draft.edited_body = run.draft.body + "\n\nPS - congratulations on the Series B."
+        run.draft.decision = "approved"
+        run.draft.decided_at = "2026-11-17T10:00:00+00:00"
+        run.status = STATUS_APPROVED
+        store.save(run)
+
+        assert len(store.list_runs()) == 1                 # still one run
+        row = store.list_runs()[0]
+        assert "manual" in row["signal"] and "7 of 10" in row["signal"]
+        assert "reviewer's choice" in row["signal"]
+
+        loaded = store.get(run.run_id)
+        assert loaded.status == STATUS_APPROVED
+        assert loaded.active_id == "f-2" and loaded.draft.finding_id == "f-2"
+        assert loaded.recommended_id == "f-1"
+        assert loaded.selected_finding().claim.startswith("In a trade-press interview")
+        assert "Series B" in loaded.draft.final_body()
+        assert loaded.score_for("f-2").total == 7
+        assert loaded.has_ranking()
+
+
+def test_legacy_run_without_ranking_still_opens(monkeypatch):
+    """A run saved before ranking existed keeps its evidence and draft."""
+    legacy = fixtures.build("A").to_dict()
+    for key in ("scores", "ranking", "recommended_id", "active_id"):
+        legacy.pop(key)
+    for f in legacy["findings"]:
+        f.pop("finding_id")
+    legacy["draft"].pop("finding_id")
+    legacy["selected_index"] = 0
+
+    run = Run.from_dict(legacy)
+    assert not run.has_ranking()
+    assert run.scores == [] and run.ranking == []
+    assert run.selected_finding() is not None            # falls back to the index
+    assert run.selected_finding().claim.startswith("Northwind Logistics has an open")
+    assert run.draft.subject and run.checks                # original draft intact
+    assert "no score recorded" in _signal_text(legacy)     # labelled, not invented
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "legacy.db"
+        monkeypatch.setattr(config, "sqlite_path", lambda: db)
+        monkeypatch.setattr(config, "database_url", lambda: None)
+        from outreach.store import Store
+
+        store = Store()
+        store.save(run)
+        again = store.get(run.run_id)
+        assert not again.has_ranking()
+        assert again.selected_finding().claim == run.selected_finding().claim
+
+
+def test_fixture_a_is_demo_ready():
+    """The happy-path fixture must show the ranking the demo talks about."""
+    a = fixtures.build("A")
+    totals = {s.finding_id: s.total for s in a.scores}
+    assert totals == {"f-1": 9, "f-2": 7, "f-3": 5}
+    assert sum(1 for s in a.scores if s.eligibility == ELIGIBLE) == 2
+    assert sum(1 for s in a.scores if s.eligibility == CONTEXT_ONLY) == 1
+    assert a.recommended_id == "f-1" and a.draft.finding_id == "f-1"
+    # Every score carries a reason a reviewer can disagree with.
+    for s in a.scores:
+        for key, _, _, _, reason in s.components():
+            assert reason, (s.finding_id, key)
+
+
+def test_fixture_c_refuses_to_draft_despite_a_seven_out_of_ten():
+    c = fixtures.build("C")
+    assert c.status == STATUS_INSUFFICIENT_EVIDENCE
+    assert max(s.total for s in c.scores) == 7
+    assert all(s.eligibility == CONTEXT_ONLY for s in c.scores)
+    assert not c.draft.subject and c.active_id == ""
+    assert "cannot buy a product connection" in c.stop_reason
 
 
 if __name__ == "__main__":
