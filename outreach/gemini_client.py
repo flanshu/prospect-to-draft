@@ -73,7 +73,7 @@ def _client():
         from google import genai
     except ImportError as exc:  # pragma: no cover
         raise ResearchProviderError(f"google-genai is not installed: {exc}") from exc
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=key, http_options={"api_version": "v1beta"})
 
 
 # ---------------------------------------------------------------------------
